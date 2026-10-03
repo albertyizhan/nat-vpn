@@ -55,14 +55,16 @@ detect_public_host() {
 }
 
 cleanup() {
-  rm -f "$WORK_DIR/release.json" "$WORK_DIR/xray.zip" "$WORK_DIR/xray"
+  rm -f "$WORK_DIR/release.json"
+  rm -f "$WORK_DIR/xray.zip"
+  rm -f "$WORK_DIR/xray"
   rmdir "$WORK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 install_deps() {
   echo "[1/6] 安装依赖..."
-  apk add --no-cache ca-certificates curl unzip openssl
+  apk add --no-cache ca-certificates curl unzip openssl jq
   update-ca-certificates
   PUBLIC_HOST="$(detect_public_host)"
   if [ -n "$PUBLIC_HOST" ]; then
@@ -82,20 +84,46 @@ arch_name() {
   esac
 }
 
+resolve_latest_version() {
+  local latest_url
+  echo "查询 GitHub 官方最新正式发布..."
+  if curl -fL --connect-timeout 10 --max-time 30 \
+    -H 'Accept: application/vnd.github+json' \
+    -o "$WORK_DIR/release.json" \
+    "https://api.github.com/repos/XTLS/Xray-core/releases/latest"; then
+    XRAY_VERSION="$(jq -er \
+      'select(.draft == false and .prerelease == false) | .tag_name | select(type == "string" and length > 0)' \
+      "$WORK_DIR/release.json" 2>/dev/null || true)"
+  fi
+  if [ -z "$XRAY_VERSION" ]; then
+    echo "官方 API 未返回版本，尝试最新发布页面..."
+    if latest_url="$(curl -fIL --connect-timeout 10 --max-time 30 \
+      -o /dev/null -w '%{url_effective}' \
+      "https://github.com/XTLS/Xray-core/releases/latest")"; then
+      case "$latest_url" in
+        https://github.com/XTLS/Xray-core/releases/tag/*)
+          XRAY_VERSION="${latest_url##*/}"
+          ;;
+      esac
+    fi
+  fi
+  [ -n "$XRAY_VERSION" ] ||
+    die "无法确认官方最新版；已停止，不会使用写死版本或镜像旧版。请恢复 GitHub 访问后重试。"
+}
+
 download_xray() {
   echo "[2/6] 检查 Xray 下载源..."
   mkdir -p "$WORK_DIR"
   machine="$(arch_name)"
   if [ -z "$XRAY_VERSION" ]; then
-    if curl -fL --connect-timeout 10 --max-time 30 \
-      -H 'Accept: application/vnd.github+json' \
-      -o "$WORK_DIR/release.json" \
-      "https://api.github.com/repos/XTLS/Xray-core/releases/latest"; then
-      XRAY_VERSION="$(sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$WORK_DIR/release.json" | head -n1)"
-    fi
+    resolve_latest_version
+    echo "官方最新正式版本: ${XRAY_VERSION}"
+  else
+    echo "使用用户明确指定的版本: ${XRAY_VERSION}"
   fi
-  [ -n "$XRAY_VERSION" ] || XRAY_VERSION="v26.9.9"
   case "$XRAY_VERSION" in v*) ;; *) XRAY_VERSION="v${XRAY_VERSION}" ;; esac
+  printf '%s\n' "$XRAY_VERSION" | grep -Eq '^v[0-9][A-Za-z0-9._-]*$' ||
+    die "版本标签格式无效: ${XRAY_VERSION}"
 
   github_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${machine}.zip"
   mirror_url="https://sourceforge.net/projects/xray-core.mirror/files/${XRAY_VERSION}/Xray-linux-${machine}.zip/download"
@@ -104,19 +132,11 @@ download_xray() {
     -o "$WORK_DIR/xray.zip" "$github_url"; then
     echo "Xray 下载成功: GitHub"
   else
-    echo "GitHub 不可用，切换 SourceForge 镜像..."
+    echo "GitHub 下载失败，尝试 SourceForge 的同一版本 ${XRAY_VERSION}..."
     rm -f "$WORK_DIR/xray.zip"
-    if ! curl -fL --connect-timeout 10 --max-time 180 --retry 1 \
-      -o "$WORK_DIR/xray.zip" "$mirror_url"; then
-      # The mirror can lag behind GitHub; retry its known stable archive.
-      fallback_version="v26.3.27"
-      fallback_url="https://sourceforge.net/projects/xray-core.mirror/files/${fallback_version}/Xray-linux-${machine}.zip/download"
-      echo "当前镜像版本不存在，尝试 ${fallback_version}..."
-      rm -f "$WORK_DIR/xray.zip"
-      curl -fL --connect-timeout 10 --max-time 180 --retry 1 \
-        -o "$WORK_DIR/xray.zip" "$fallback_url" ||
-        die "GitHub 和 SourceForge 镜像都无法下载 Xray"
-    fi
+    curl -fL --connect-timeout 10 --max-time 180 --retry 1 \
+      -o "$WORK_DIR/xray.zip" "$mirror_url" ||
+      die "无法下载 ${XRAY_VERSION}，镜像可能尚未同步；已停止，不自动降级。"
   fi
   unzip -oq "$WORK_DIR/xray.zip" xray -d "$WORK_DIR"
   install -m 0755 "$WORK_DIR/xray" "$XRAY_BIN"
