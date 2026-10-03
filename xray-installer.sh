@@ -45,6 +45,22 @@ ask_port() {
 }
 rand_hex() { openssl rand -hex "$1"; }
 rand_password() { openssl rand -base64 24 | tr -d '=+/'; }
+reality_key_field() {
+  awk -F ':' -v field="$1" '
+    {
+      label = tolower($1)
+      gsub(/[[:space:]()]/, "", label)
+      if ((field == "private" && label == "privatekey") ||
+          (field == "public" && (label == "publickey" ||
+                                label == "passwordpublickey" || label == "password"))) {
+        value = $2
+        gsub(/[[:space:]]/, "", value)
+        print value
+        exit
+      }
+    }
+  '
+}
 detect_public_host() {
   public_host=""
   for endpoint in https://api.ipify.org https://ifconfig.me/ip; do
@@ -160,11 +176,15 @@ EOF
 
 make_vless_config() {
   local role="$1"
-  local uuid private public short_id ss_address ss_port ss_password
+  local uuid keys private public short_id ss_address ss_port ss_password
   uuid="$("$XRAY_BIN" uuid)"
   keys="$("$XRAY_BIN" x25519)"
-  private="$(printf '%s\n' "$keys" | sed -n 's/^Private key:[[:space:]]*//p')"
-  public="$(printf '%s\n' "$keys" | sed -n 's/^Public key:[[:space:]]*//p')"
+  private="$(printf '%s\n' "$keys" | reality_key_field private)"
+  public="$(printf '%s\n' "$keys" | reality_key_field public)"
+  printf '%s\n' "$private" | grep -Eq '^[A-Za-z0-9_-]{43}$' ||
+    die "未提取到有效 Reality 私钥，已停止；请检查 xray x25519 输出格式，不要公开私钥。"
+  printf '%s\n' "$public" | grep -Eq '^[A-Za-z0-9_-]{43}$' ||
+    die "未提取到有效 Reality 公钥，已停止；请检查 xray x25519 输出格式。"
   short_id="$(rand_hex 8)"
   if [ "$role" = relay ]; then
     echo "上游落地协议: Shadowsocks，aes-128-gcm；请先部署落地节点。"
@@ -179,7 +199,7 @@ make_vless_config() {
     "listen": "0.0.0.0",
     "port": ${LISTEN_PORT},
     "protocol": "vless",
-    "settings": {"clients": [{"id": "${uuid}"}], "decryption": "none"},
+    "settings": {"clients": [{"id": "${uuid}", "flow": "xtls-rprx-vision"}], "decryption": "none"},
     "streamSettings": {
       "network": "raw",
       "security": "reality",
@@ -212,7 +232,7 @@ EOF
     "listen": "0.0.0.0",
     "port": ${LISTEN_PORT},
     "protocol": "vless",
-    "settings": {"clients": [{"id": "${uuid}"}], "decryption": "none"},
+    "settings": {"clients": [{"id": "${uuid}", "flow": "xtls-rprx-vision"}], "decryption": "none"},
     "streamSettings": {
       "network": "raw",
       "security": "reality",
@@ -231,7 +251,7 @@ EOF
 EOF
   fi
   CLIENT_HOST="$(ask '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
-  LINK="vless://${uuid}@${CLIENT_HOST}:${PUBLIC_PORT}?encryption=none&security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${public}&sid=${short_id}&type=tcp#Alpine-Xray"
+  LINK="vless://${uuid}@${CLIENT_HOST}:${PUBLIC_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${public}&sid=${short_id}&type=tcp#Alpine-Xray"
 }
 
 make_hy2_config() {
@@ -344,7 +364,7 @@ main() {
     esac
   fi
   case "$protocol" in
-    1) protocol_name="VLESS + Reality"; transport="TCP"; default_listen=443 ;;
+    1) protocol_name="VLESS + Reality (xtls-rprx-vision)"; transport="TCP"; default_listen=443 ;;
     2) protocol_name="Hysteria2"; transport="UDP"; default_listen=443 ;;
     ss) protocol_name="Shadowsocks (aes-128-gcm)"; transport="TCP"; default_listen=8388 ;;
     *) die "协议选择无效" ;;
