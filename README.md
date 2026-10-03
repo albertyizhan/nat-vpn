@@ -43,13 +43,15 @@ sh /root/xray-installer.sh
 
 默认值会在每个输入提示中显示，按回车即可采用。公网 IP 自动探测结果用作连接地址默认值，可手动修改。
 
+VLESS + Reality 默认使用 `xtls-rprx-vision`，服务端配置与生成的分享链接均包含此 Flow；客户端需支持 Vision。
+
 ## 部署模式
 
 | 模式 | 角色 | 入站协议 | 出站 |
 | --- | --- | --- | --- |
-| 直连 | 直连节点 | VLESS + Reality 或 Hysteria2 | 本机直连公网 |
-| 中转 | 中转节点 | VLESS + Reality 或 Hysteria2 | 用户指定的 Shadowsocks 落地节点 |
-| 中转 | 落地节点 | Shadowsocks，默认 `aes-128-gcm` | 本机直连公网 |
+| 直连 | 直连节点 | VLESS + Reality + xtls-rprx-vision 或 Hysteria2 | 本机直连公网 |
+| 中转 | 中转节点 | VLESS + Reality + xtls-rprx-vision 或 Hysteria2 | 用户指定的 Shadowsocks 落地节点 |
+| 中转 | 落地节点 | Shadowsocks，默认 `aes-128-gcm`加密 | 本机直连公网 |
 
 直连节点自动生成客户端凭据。落地节点自动生成 SS 密码；部署中转节点时，需要输入已有落地节点的地址、对外端口和相同密码。
 
@@ -65,7 +67,7 @@ sh /root/xray-installer.sh
 
 | 协议 | 传输 | 默认监听端口 |
 | --- | --- | --- |
-| VLESS + Reality | TCP | `443` |
+| VLESS + Reality + xtls-rprx-vision | TCP | `443` |
 | Hysteria2 | UDP | `443` |
 | Shadowsocks 落地 | TCP | `8388` |
 
@@ -93,10 +95,19 @@ Hysteria2 保持证书校验，不使用 `insecure=1`。选择此协议需要：
 
 ## 服务管理
 
+查看状态
 ```sh
 rc-service xray status
+```
+重新启动
+```sh
 rc-service xray restart
+```
+测试配置
+```sh
 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
 ```
 
 配置文件为 `/usr/local/etc/xray/config.json`。服务加入 OpenRC 的 `default` runlevel；服务输出丢弃到 `/dev/null`，不创建持久化日志文件。
+
+---本脚本由GPT-6.1 sol编写，需反复改进
