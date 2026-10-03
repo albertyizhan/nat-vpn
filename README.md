@@ -2,8 +2,6 @@
 
 面向 Alpine Linux / OpenRC 的交互式安装器，支持直连、中转和落地部署，以及 NAT / 非 NAT 网络。
 
-仓库：[albertyizhan/nat-vpn](https://github.com/albertyizhan/nat-vpn)
-
 ## 快速开始
 
 在目标 Alpine 机器的终端中，以 `root` 身份执行。脚本名称为 `xray-installer.sh`。
