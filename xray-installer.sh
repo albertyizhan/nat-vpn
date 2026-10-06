@@ -24,6 +24,47 @@ NODE_NAME=""
 
 die() { echo "错误: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"; }
+trusted_path() {
+  local path="$1" kind="${2:-any}" part owner mode child=0
+  case "$path" in
+    /*) ;;
+    *) die "路径必须为绝对路径: $path" ;;
+  esac
+  if [ -e "$path" ]; then
+    case "$kind" in
+      file) [ -f "$path" ] || die "需要普通文件路径: $path" ;;
+      dir) [ -d "$path" ] || die "需要目录路径: $path" ;;
+    esac
+  fi
+  case "$path" in
+    *[!A-Za-z0-9_./-]*|*//*|*/../*|*/./*|*/..|*/.|*/)
+      die "路径仅允许字母、数字、下划线、点、连字符和单个斜杠: $path" ;;
+  esac
+  part="$path"
+  while :; do
+    [ ! -L "$part" ] || die "不能使用符号链接路径: $part"
+    if [ -e "$part" ]; then
+      [ -d "$part" ] || [ -f "$part" ] || die "路径不是普通文件或目录: $part"
+      owner="$(stat -c %u "$part")"
+      mode="$(stat -c %a "$part")"
+      [ "$owner" = 0 ] || die "路径必须属于 root: $part"
+      if [ "$((0$mode & 022))" -ne 0 ]; then
+        # A root-owned child under a sticky temporary directory cannot be replaced by other users.
+        [ "$child" = 1 ] && [ -d "$part" ] && [ "$((0$mode & 01000))" -ne 0 ] ||
+          die "路径不能允许组或其他用户写入: $part"
+      fi
+      if [ -f "$part" ]; then
+        [ "$(stat -c %h "$part")" = 1 ] || die "不能写入硬链接文件: $part"
+      fi
+      child=1
+    else
+      child=0
+    fi
+    [ "$part" != / ] || break
+    part="${part%/*}"
+    [ -n "$part" ] || part=/
+  done
+}
 validate_reality_server_name() {
   case "$SERVER_NAME" in
     *[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]*)
@@ -85,14 +126,8 @@ ask_secret() {
   done
 }
 fetch_to() {
-  output="$1"; url="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --connect-timeout 10 --max-time 180 --retry 1 -o "$output" "$url"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$output" "$url"
-  else
-    return 1
-  fi
+  local output="$1" url="$2"
+  timeout 180 wget --timeout=15 --tries=2 -O "$output" "$url"
 }
 fetch_text() {
   output="$1"; url="$2"
@@ -130,18 +165,11 @@ probe_sni() {
     echo "$host: 证书消息 ${cert_bytes} 字节，超过保守阈值 7000，跳过。" >&2
     return 1
   fi
-  if command -v curl >/dev/null 2>&1; then
-    speed="$(curl --noproxy '*' --connect-timeout 5 --max-time 10 \
+  speed="$(curl --noproxy '*' --connect-timeout 5 --max-time 10 \
       --tlsv1.3 --tls-max 1.3 -sS -o /dev/null -w '%{time_appconnect}' \
       "https://$host/" 2>/dev/null)" || {
         echo "$host: HTTPS 测速失败，跳过。" >&2; return 1;
       }
-  else
-    speed="999.000000"
-    wget -q --timeout=10 --tries=1 -O /dev/null "https://$host/" 2>/dev/null || {
-      echo "$host: HTTPS 测试失败，跳过。" >&2; return 1;
-    }
-  fi
   printf '%s\n' "$speed" | grep -Eq '^[0-9]+\.[0-9]+$' || return 1
   echo "$host: 通过；TLS 建连 ${speed}s；证书消息 ${cert_bytes} 字节。" >&2
   printf '%s\t%s\n' "$speed" "$host"
@@ -161,7 +189,7 @@ choose_reality_sni() {
       sort -n "$WORK_DIR/sni-results.tsv" > "$WORK_DIR/sni-ranked.tsv"
       if [ -s "$WORK_DIR/sni-ranked.tsv" ]; then
         recommended="$(awk 'NR==1 {print $2}' "$WORK_DIR/sni-ranked.tsv")"
-        echo "推荐: $recommended（本轮通过检查且 TLS 建连最快，不代表端到端代理延迟最佳）。"
+        echo "推荐: ${recommended}（本轮通过检查且 TLS 建连最快，不代表端到端代理延迟最佳）。"
         awk '{printf "  %d. %s (%ss)\n", NR, $2, $1}' "$WORK_DIR/sni-ranked.tsv"
         echo "  0. 手动输入"
         while :; do
@@ -225,12 +253,16 @@ cleanup() {
   if [ -n "$WORK_DIR" ]; then
     rm -f "$WORK_DIR/release.json"
     rm -f "$WORK_DIR/xray.zip"
+    rm -f "$WORK_DIR/xray.zip.dgst"
     rm -f "$WORK_DIR/xray"
     rm -f "$WORK_DIR/node.json"
     rm -f "$WORK_DIR/node-state.json"
+    rm -f "$WORK_DIR/time-probe.conf"
+    rm -f "$WORK_DIR/time-probe.log"
     rm -f "$WORK_DIR/sni-probe.txt"
     rm -f "$WORK_DIR/sni-results.tsv"
     rm -f "$WORK_DIR/sni-ranked.tsv"
+    rm -f "$WORK_DIR/public-ip"
     rmdir "$WORK_DIR" 2>/dev/null || true
   fi
   [ -z "$CANDIDATE_CONFIG" ] || rm -f "$CANDIDATE_CONFIG"
@@ -244,13 +276,7 @@ install_deps() {
   echo "[1/6] 安装依赖..."
   command -v apk >/dev/null 2>&1 || die "这不是 Alpine Linux，找不到 apk。"
   mkdir -p "$XRAY_DIR"
-  apk add --no-cache ca-certificates unzip openssl jq
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    echo "未找到 curl 或 wget，安装 BusyBox wget..."
-    apk add --no-cache wget
-  fi
-  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 ||
-    die "下载工具不可用，请先检查 Alpine 软件源。"
+  apk add --no-cache ca-certificates wget curl unzip openssl jq libstdc++ libgcc
   update-ca-certificates
   PUBLIC_HOST="$(detect_public_host)"
   if [ -n "$PUBLIC_HOST" ]; then
@@ -258,6 +284,57 @@ install_deps() {
   else
     echo "未能自动探测公网地址，稍后手动输入。"
   fi
+}
+
+check_system_time() {
+  local drift
+  echo "检查系统时间（当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S')）..."
+  command -v chronyc >/dev/null 2>&1 && command -v chronyd >/dev/null 2>&1 ||
+    apk add --no-cache chrony
+  if ! pidof chronyd >/dev/null 2>&1 && pidof ntpd >/dev/null 2>&1; then
+    # Do not replace an already running NTP daemon.
+    printf '%s\n' 'pool pool.ntp.org iburst' 'pool time.google.com iburst' \
+      > "$WORK_DIR/time-probe.conf"
+    echo "已有 ntpd，保留原服务；使用 chronyd 只查询偏差，不修改系统时间。"
+    if chronyd -Q -t 25 -f "$WORK_DIR/time-probe.conf" > "$WORK_DIR/time-probe.log" 2>&1; then
+      drift="$(awk '/System clock wrong by/ {
+        for(i=1;i<=NF;i++) if($i=="by") {print $(i+1); exit}
+      }' "$WORK_DIR/time-probe.log")"
+      if printf '%s\n' "$drift" | grep -Eq '^-?[0-9]+([.][0-9]+)?$' &&
+         awk -v v="$drift" 'BEGIN {if(v<0)v=-v; exit !(v<=1)}'; then
+        echo "NTP 查询通过，系统偏差 ${drift}s（不超过 1 秒）。"
+        return
+      fi
+    fi
+    cat "$WORK_DIR/time-probe.log"
+  else
+    [ -x /etc/init.d/chronyd ] || apk add --no-cache chrony-openrc
+    echo "使用 chronyd 持续校时，等待 NTP 同步（最多约 30 秒）。"
+    rc-update add chronyd default
+    if rc-service chronyd status >/dev/null 2>&1 || rc-service chronyd start; then
+      if chronyc waitsync 15 1 0 2; then
+        echo "系统时间已同步，剩余校正不超过 1 秒。"
+        chronyc tracking
+        return
+      fi
+      echo "同步未达标；如果主机允许校时，可立即校正已选定的 NTP 偏差。"
+      chronyc tracking || true
+      case "$(ask '允许 chronyc makestep 立即跳变系统时间？可能影响本机其他服务 [y/N]' N)" in
+        y|Y)
+          if chronyc makestep && chronyc waitsync 5 1 0 2; then
+            echo "校时完成（UTC: $(date -u '+%Y-%m-%d %H:%M:%S')）。"
+            return
+          fi
+          ;;
+      esac
+    fi
+  fi
+  echo "未能确认系统时间准确。NAT 需允许出站 UDP 123；容器可能只能由宿主机校时。"
+  echo "客户端也需要准确时间；修改时区不能修正系统时钟偏差。"
+  case "$(ask '尚未校时成功，仍继续安装？[y/N]' N)" in
+    y|Y) echo "按你的选择继续，请在使用节点前修复主机时间。" ;;
+    *) die "已停止，请校准宿主机时间或恢复 NTP 后再运行。" ;;
+  esac
 }
 
 arch_name() {
@@ -271,7 +348,6 @@ arch_name() {
 }
 
 resolve_latest_version() {
-  local latest_url
   echo "查询 GitHub 官方最新正式发布..."
   if fetch_to "$WORK_DIR/release.json" \
     "https://api.github.com/repos/XTLS/Xray-core/releases/latest"; then
@@ -279,21 +355,22 @@ resolve_latest_version() {
       'select(.draft == false and .prerelease == false) | .tag_name | select(type == "string" and length > 0)' \
       "$WORK_DIR/release.json" 2>/dev/null || true)"
   fi
-  if [ -z "$XRAY_VERSION" ]; then
-    echo "官方 API 未返回版本，尝试最新发布页面..."
-    if command -v curl >/dev/null 2>&1 &&
-       latest_url="$(curl -fIL --connect-timeout 10 --max-time 30 \
-         -o /dev/null -w '%{url_effective}' \
-         "https://github.com/XTLS/Xray-core/releases/latest")"; then
-      case "$latest_url" in
-        https://github.com/XTLS/Xray-core/releases/tag/*)
-          XRAY_VERSION="${latest_url##*/}"
-          ;;
-      esac
-    fi
-  fi
   [ -n "$XRAY_VERSION" ] ||
     die "无法确认官方最新版；已停止，不会使用写死版本或镜像旧版。请恢复 GitHub 访问后重试。"
+}
+
+verify_xray_archive() {
+  local expected actual
+  expected="$(awk -F= '
+    $1 ~ /^[[:space:]]*SHA(2-)?256[[:space:]]*$/ {
+      value=$2; gsub(/[[:space:]\r]/, "", value); print tolower(value)
+    }' "$WORK_DIR/xray.zip.dgst")"
+  printf '%s\n' "$expected" | grep -Eq '^[0-9a-f]{64}$' &&
+    [ "${#expected}" -eq 64 ] || die "官方 SHA256 校验文件格式无效，未安装。"
+  actual="$(sha256sum "$WORK_DIR/xray.zip")"
+  actual="${actual%% *}"
+  [ "$actual" = "$expected" ] || die "Xray 下载包 SHA256 不匹配，未解压或执行。"
+  echo "官方 SHA256 校验通过。"
 }
 
 download_xray() {
@@ -313,6 +390,9 @@ download_xray() {
   github_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${machine}.zip"
   mirror_url="https://sourceforge.net/projects/xray-core.mirror/files/${XRAY_VERSION}/Xray-linux-${machine}.zip/download"
   echo "目标版本: ${XRAY_VERSION}"
+  echo "获取 GitHub 官方同版本、同架构校验文件..."
+  fetch_to "$WORK_DIR/xray.zip.dgst" "$github_url.dgst" ||
+    die "无法取得官方校验文件，已停止；不会使用镜像提供的校验值。"
   if fetch_to "$WORK_DIR/xray.zip" "$github_url"; then
     echo "Xray 下载成功: GitHub"
   else
@@ -321,12 +401,15 @@ download_xray() {
     fetch_to "$WORK_DIR/xray.zip" "$mirror_url" ||
       die "无法下载 ${XRAY_VERSION}，镜像可能尚未同步；已停止，不自动降级。"
   fi
+  verify_xray_archive
   unzip -oq "$WORK_DIR/xray.zip" xray -d "$WORK_DIR"
+  mkdir -p "${XRAY_BIN%/*}"
   install -m 0755 "$WORK_DIR/xray" "$XRAY_BIN"
   "$XRAY_BIN" version | head -n1
 }
 
 write_service() {
+  trusted_path "/etc/init.d/${SERVICE_NAME}" file
   cat > "/etc/init.d/${SERVICE_NAME}" <<EOF
 #!/sbin/openrc-run
 command="${XRAY_BIN}"
@@ -342,6 +425,7 @@ EOF
 }
 
 write_cert_renewal() {
+  trusted_path /etc/periodic/daily/xray-cert-renew file
   mkdir -p /etc/periodic/daily
   cat > /etc/periodic/daily/xray-cert-renew <<EOF
 #!/bin/sh
@@ -624,6 +708,10 @@ main() {
   need_root
   validate_reality_server_name
   umask 077
+  trusted_path "$XRAY_DIR" dir
+  trusted_path "$XRAY_BIN" file
+  trusted_path "$XRAY_DIR/config.json" file
+  trusted_path "$XRAY_DIR/manager-state.json" file
   mkdir -p "$XRAY_DIR"
   mkdir "$XRAY_DIR/.manager.lock" 2>/dev/null ||
     die "另一个安装/管理任务正在运行，或上次异常退出留下了 $XRAY_DIR/.manager.lock；确认无人运行后手动处理。"
@@ -631,6 +719,7 @@ main() {
   WORK_DIR="$(mktemp -d /tmp/xray-installer.XXXXXX)"
   GENERATED_CONFIG="$WORK_DIR/node.json"
   install_deps
+  check_system_time
   if [ -e "$XRAY_DIR/manager-state.json" ]; then
     jq -e 'type=="object" and ((.nodes // {}) | type=="object")' "$XRAY_DIR/manager-state.json" >/dev/null ||
       die "管理器状态文件损坏，未覆盖。请检查 $XRAY_DIR/manager-state.json"
