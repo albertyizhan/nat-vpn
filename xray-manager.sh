@@ -3,7 +3,7 @@ set -eu
 umask 077
 
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
-XRAY_DIR="${XRAY_DIR:-/usr/local/etc/xray}"
+XRAY_DIR="${XRAY_DIR:-/etc/xray}"
 CONFIG="${CONFIG:-$XRAY_DIR/config.json}"
 STATE="${STATE:-$XRAY_DIR/manager-state.json}"
 SERVICE="${SERVICE:-xray}"
@@ -59,7 +59,7 @@ restart_service() {
 
 commit_config() {
   candidate="$1"
-  "$XRAY_BIN" run -test -config "$candidate" >/dev/null ||
+  "$XRAY_BIN" run -test -format json -config "$candidate" >/dev/null ||
     die "候选配置检查失败，原配置未改变。"
   backup="${CONFIG}.bak.$(date +%Y%m%d%H%M%S).$$"
   cp "$CONFIG" "$backup"
@@ -282,7 +282,7 @@ install_checker() {
 set -eu
 umask 077
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
-XRAY_DIR="${XRAY_DIR:-/usr/local/etc/xray}"
+XRAY_DIR="${XRAY_DIR:-/etc/xray}"
 CONFIG="$XRAY_DIR/config.json"
 STATE="$XRAY_DIR/manager-state.json"
 SERVICE="${SERVICE:-xray}"
@@ -321,7 +321,7 @@ while IFS="$(printf '\t')" read -r key tag email quota online base saved_month d
         end
       else . end]
     ' "$CONFIG" > "$tmp"
-    "$XRAY_BIN" run -test -config "$tmp" >/dev/null || continue
+    "$XRAY_BIN" run -test -format json -config "$tmp" >/dev/null || continue
     backup="$CONFIG.bak.quota.$(date +%Y%m%d%H%M%S).$$"
     cp "$CONFIG" "$backup"
     chmod 600 "$backup"
@@ -356,7 +356,7 @@ EOF
 restore_backup() {
   latest="$(ls -1t "$CONFIG".bak.* 2>/dev/null | head -n1 || true)"
   [ -n "$latest" ] || die "没有找到备份。"
-  "$XRAY_BIN" run -test -config "$latest" >/dev/null || die "备份配置检查失败，未恢复。"
+  "$XRAY_BIN" run -test -format json -config "$latest" >/dev/null || die "备份配置检查失败，未恢复。"
   current="${CONFIG}.restore-current.$$"
   cp "$CONFIG" "$current"; chmod 600 "$current"
   cp "$latest" "$CONFIG"; chmod 600 "$CONFIG"
@@ -365,7 +365,7 @@ restore_backup() {
   echo "已恢复: $latest"
 }
 
-check_config() { "$XRAY_BIN" run -test -config "$CONFIG"; }
+check_config() { "$XRAY_BIN" run -test -format json -config "$CONFIG"; }
 
 main() {
   need_root; need_tools; acquire_lock
