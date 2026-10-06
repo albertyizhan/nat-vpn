@@ -2,401 +2,658 @@
 set -eu
 umask 077
 
-XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_DIR="${XRAY_DIR:-/etc/xray}"
+XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 CONFIG="${CONFIG:-$XRAY_DIR/config.json}"
 STATE="${STATE:-$XRAY_DIR/manager-state.json}"
 SERVICE="${SERVICE:-xray}"
-API_TAG="${API_TAG:-api}"
-API_PORT="${API_PORT:-10085}"
-CHECKER="${CHECKER:-$XRAY_DIR/quota-check.sh}"
-LOCK_DIR="${LOCK_DIR:-$XRAY_DIR/.manager.lock}"
-LOCK_HELD=0
+LOG_DIR="${LOG_DIR:-$XRAY_DIR/logs}"
+RUNNER="$XRAY_DIR/manager.sh"
+SELF="$(readlink -f "$0")"
+TX=""
+LOCK=""
 
-die() { echo "错误: $*" >&2; exit 1; }
-need_root() { [ "$(id -u)" -eq 0 ] || die "请使用 root 运行。"; }
+die() { printf '错误: %s\n' "$*" >&2; exit 1; }
+ask() { printf '%s: ' "$1" >&2; IFS= read -r answer || exit 1; printf '%s' "$answer"; }
+confirm() { case "$(ask "$1 [y/N]")" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
+valid_name() { printf '%s\n' "$1" | grep -Eq '^[A-Za-z][A-Za-z0-9]*$'; }
+valid_host() { printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.:-]*$'; }
+valid_number() {
+  case "$1" in ''|*[!0-9]*|0[0-9]*) return 1 ;; esac
+  [ "${#1}" -le 9 ]
+}
+valid_port() { valid_number "$1" && [ "$1" -gt 0 ] && [ "$1" -le 65535 ]; }
+valid_sni() {
+  case "$1" in *[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]*) return 1 ;; esac
+  printf '%s\n' "$1" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
+}
+uri() { jq -rn --arg v "$1" '$v | @uri'; }
+
+cleanup() {
+  if [ -n "$TX" ]; then
+    rm -f "$TX/config.json"
+    rm -f "$TX/state.json"
+    rm -f "$TX/old-config.json"
+    rm -f "$TX/old-state.json"
+    rm -f "$TX/stats.json"
+    rm -f "$TX/access.txt"
+    rm -f "$TX/next.json"
+    rm -f "$TX/connections.txt"
+    rmdir "$TX" 2>/dev/null || true
+  fi
+  [ -z "$LOCK" ] || rmdir "$LOCK" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 need_tools() {
-  command -v jq >/dev/null 2>&1 || die "缺少 jq，请先执行: apk add --no-cache jq";
-  [ -x "$XRAY_BIN" ] || die "找不到 Xray: $XRAY_BIN";
-  [ -r "$CONFIG" ] || die "找不到配置: $CONFIG";
-  jq empty "$CONFIG" >/dev/null 2>&1 || die "配置不是有效 JSON: $CONFIG";
+  [ "$(id -u)" -eq 0 ] || die "请使用 root 运行。"
+  command -v jq >/dev/null 2>&1 || die "缺少 jq，请执行 apk add --no-cache jq。"
+  [ -x "$XRAY_BIN" ] || die "找不到 Xray: $XRAY_BIN"
+  [ -r "$CONFIG" ] || die "找不到配置: $CONFIG"
+  jq -e 'type=="object" and (.inbounds | type=="array")' "$CONFIG" >/dev/null ||
+    die "配置格式不正确。"
+  [ ! -e "$STATE" ] || jq -e 'type=="object" and ((.nodes // {}) | type=="object")' "$STATE" >/dev/null ||
+    die "状态文件损坏，未覆盖: $STATE"
+  command -v rc-service >/dev/null 2>&1 || die "需要 Alpine OpenRC 的 rc-service。"
+}
+
+# Each action owns the lock; idle menus do not block the sampler.
+begin() {
   mkdir -p "$XRAY_DIR"
-  touch "$STATE"
-  if [ ! -s "$STATE" ]; then printf '%s\n' '{"users":{}}' > "$STATE"; fi
-  jq empty "$STATE" >/dev/null 2>&1 || die "状态文件不是有效 JSON: $STATE";
+  if ! mkdir "$XRAY_DIR/.manager.lock" 2>/dev/null; then
+    [ "${1:-}" = background ] && exit 0
+    die "另一个安装/管理任务正在运行，请稍后重试。"
+  fi
+  LOCK="$XRAY_DIR/.manager.lock"
+  TX="$(mktemp -d "$XRAY_DIR/.manager.XXXXXX")"
+  cp "$CONFIG" "$TX/config.json"
+  cp "$CONFIG" "$TX/old-config.json"
+  if [ -e "$STATE" ]; then cp "$STATE" "$TX/old-state.json"; else printf '{}\n' > "$TX/old-state.json"; fi
+  jq --slurpfile config "$CONFIG" '
+    .nodes = (.nodes // {}) | del(.users) |
+    reduce ($config[0].inbounds[] |
+      select(.protocol=="vless" or .protocol=="shadowsocks" or .protocol=="hysteria") |
+      select((.tag // "") | test("^[A-Za-z][A-Za-z0-9]*$"))) as $i
+      (.; .nodes[$i.tag] = ((.nodes[$i.tag] // {}) +
+        {inbound:$i, disabled:false}))
+  ' "$TX/old-state.json" > "$TX/state.json"
+}
+
+state_edit() {
+  local filter
+  filter="$1"; shift
+  jq "$@" "$filter" "$TX/state.json" > "$TX/next.json"
+  mv "$TX/next.json" "$TX/state.json"
+}
+config_edit() {
+  local filter
+  filter="$1"; shift
+  jq "$@" "$filter" "$TX/config.json" > "$TX/next.json"
+  mv "$TX/next.json" "$TX/config.json"
+}
+node() { jq -c --arg tag "$1" '.nodes[$tag].inbound // empty' "$TX/state.json"; }
+node_value() { node "$1" | jq -r "$2"; }
+state_value() { jq -r --arg tag "$1" ".nodes[\$tag] | $2" "$TX/state.json"; }
+
+api_address() {
+  jq -er '
+    .api.tag as $tag |
+    .inbounds[] | select(.tag==$tag and .listen=="127.0.0.1" and .protocol=="dokodemo-door") |
+    select(.port | type=="number") | "127.0.0.1:" + (.port | tostring)
+  ' "$TX/config.json" 2>/dev/null | head -n1
+}
+
+sample_stats() {
+  local addr epoch pid
+  addr="$(api_address)" || return 0
+  [ -n "$addr" ] || return 0
+  "$XRAY_BIN" api statsquery --server="$addr" -pattern 'inbound>>>' > "$TX/stats.json" 2>/dev/null ||
+    { echo "统计 API 暂不可用，保留已有计数。" >&2; return 0; }
+  jq -e '(.stat // []) | type=="array"' "$TX/stats.json" >/dev/null ||
+    { echo "统计响应无效，保留已有计数。" >&2; return 0; }
+  epoch=""
+  for pid in $(pidof xray 2>/dev/null || true); do
+    [ -r "/proc/$pid/stat" ] || continue
+    epoch="$epoch:$pid:$(awk '{print $22}' "/proc/$pid/stat")"
+  done
+  [ ! -r /proc/sys/kernel/random/boot_id ] || epoch="$epoch:$(cat /proc/sys/kernel/random/boot_id)"
+  state_edit '
+    ($stats[0].stat // [] | map({key:.name, value:((.value // 0)|tonumber)}) | from_entries) as $c |
+    .nodes |= with_entries(
+      .key as $tag | if .value.statistics==true then
+        ($c["inbound>>>"+$tag+">>>traffic>>>uplink"] // 0) as $up |
+        ($c["inbound>>>"+$tag+">>>traffic>>>downlink"] // 0) as $down |
+        (if .value.epoch==$epoch and $up >= (.value.last_up // 0)
+         then $up - (.value.last_up // 0) else $up end) as $du |
+        (if .value.epoch==$epoch and $down >= (.value.last_down // 0)
+         then $down - (.value.last_down // 0) else $down end) as $dd |
+        .value.upload_bytes=((.value.upload_bytes // 0)+$du) |
+        .value.download_bytes=((.value.download_bytes // 0)+$dd) |
+        .value.last_up=$up | .value.last_down=$down | .value.epoch=$epoch |
+        .value.sampled_at=$time
+      else . end)
+  ' --slurpfile stats "$TX/stats.json" --arg epoch "$epoch" --arg time "$(date -u +%FT%TZ)"
+}
+
+sample_logs() {
+  local inode offset old_inode size bytes lines tag
+  [ -r "$LOG_DIR/access.log" ] || return 0
+  inode="$(stat -c %i "$LOG_DIR/access.log")"
+  offset="$(jq -r '.log_offset // 0' "$TX/state.json")"
+  old_inode="$(jq -r '.log_inode // ""' "$TX/state.json")"
+  size="$(wc -c < "$LOG_DIR/access.log" | tr -d ' ')"
+  if [ "$inode" != "$old_inode" ] || [ "$size" -lt "$offset" ]; then offset=0; fi
+  [ "$size" -gt "$offset" ] || return 0
+  # Leave a partial trailing line for the next sample.
+  tail -c "+$((offset + 1))" "$LOG_DIR/access.log" |
+    head -c "$((size - offset))" > "$TX/access.txt"
+  # wc -l counts complete lines; head excludes a partially written last line.
+  lines="$(wc -l < "$TX/access.txt" | tr -d ' ')"
+  [ "$lines" -gt 0 ] || return 0
+  head -n "$lines" "$TX/access.txt" > "$TX/connections.txt"
+  bytes="$(wc -c < "$TX/connections.txt" | tr -d ' ')"
+  for tag in $(jq -r '.nodes | to_entries[] | select(.value.logging==true) | .key' "$TX/state.json"); do
+    valid_name "$tag" || continue
+    touch "$LOG_DIR/$tag-connections.log"
+    chmod 600 "$LOG_DIR/$tag-connections.log"
+    awk -v tag="$tag" '
+      index($0, "[" tag " -> ") || index($0, "[" tag " >> ") || index($0, "[" tag " ==> ") {
+        for (i=1;i<NF;i++) if ($i=="accepted" || $i=="rejected") {
+          print $1 " " $2 "\ttarget=" $(i+1) "\tstatus=" $i; break
+        }
+      }
+    ' "$TX/connections.txt" >> "$LOG_DIR/$tag-connections.log"
+  done
+  state_edit '.log_inode=$inode | .log_offset=$offset' --arg inode "$inode" --argjson offset "$((offset + bytes))"
+}
+
+save_only() {
+  cp "$TX/state.json" "$TX/next.json"
+  mv "$TX/next.json" "$STATE"
+  chmod 600 "$STATE"
+}
+
+apply() {
+  "$XRAY_BIN" run -test -format json -config "$TX/config.json" ||
+    die "配置检查失败，未应用。"
+  state_edit '.nodes |= with_entries(.value.epoch="" | .value.last_up=0 | .value.last_down=0)'
+  cp "$TX/config.json" "$TX/next.json"
+  mv "$TX/next.json" "$CONFIG"
+  save_only
   chmod 600 "$CONFIG" "$STATE"
-}
-ask() { printf "%s: " "$1" >&2; IFS= read -r value; printf '%s' "$value"; }
-yesno() {
-  answer="$(ask "$1 [y/N]")"
-  case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
-}
-positive_or_zero() {
-  case "$1" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$1" -ge 0 ] 2>/dev/null
-}
-valid_email() {
-  [ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._@-]+$'
-}
-config_tmp() { printf '%s.tmp.%s' "$CONFIG" "$$"; }
-acquire_lock() {
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    die "检测到另一个管理器或配额任务正在修改配置，请稍后重试。"
+  if ! rc-service "$SERVICE" restart; then
+    mv "$TX/old-config.json" "$CONFIG"
+    mv "$TX/old-state.json" "$STATE"
+    rc-service "$SERVICE" restart >/dev/null 2>&1 || true
+    die "重启失败，已恢复本次操作前的配置与状态。"
   fi
-  LOCK_HELD=1
-  trap 'if [ "$LOCK_HELD" -eq 1 ]; then rmdir "$LOCK_DIR" 2>/dev/null || true; fi' EXIT INT TERM
 }
 
-restart_service() {
-  command -v rc-service >/dev/null 2>&1 || {
-    echo "未检测到 rc-service；配置已写入，请手动重启 Xray。"
-    return 0
-  }
-  rc-service "$SERVICE" restart >/dev/null 2>&1 ||
-    rc-service "$SERVICE" start >/dev/null 2>&1 ||
-    return 1
+persist_node() {
+  # Enabled nodes live in config; disabled ones live only in manager state.
+  config_edit '
+    if $state[0].nodes[$tag].disabled==true then
+      .inbounds |= map(select(.tag != $tag))
+    elif any(.inbounds[]; .tag==$tag) then
+      .inbounds |= map(if .tag==$tag then $state[0].nodes[$tag].inbound else . end)
+    else .inbounds += [$state[0].nodes[$tag].inbound] end
+  ' --arg tag "$1" --slurpfile state "$TX/state.json"
 }
 
-commit_config() {
-  candidate="$1"
-  "$XRAY_BIN" run -test -format json -config "$candidate" >/dev/null ||
-    die "候选配置检查失败，原配置未改变。"
-  backup="${CONFIG}.bak.$(date +%Y%m%d%H%M%S).$$"
-  cp "$CONFIG" "$backup"
-  chmod 600 "$backup"
-  mv "$candidate" "$CONFIG"
-  chmod 600 "$CONFIG"
-  if ! restart_service; then
-    cp "$backup" "$CONFIG"
-    chmod 600 "$CONFIG"
-    restart_service >/dev/null 2>&1 || true
-    die "Xray 重启失败，已自动恢复原配置；备份保留在 $backup"
-  fi
-  echo "配置已应用；备份: $backup"
-}
-
-inbound_count() { jq -r '.inbounds // [] | length' "$CONFIG"; }
-inbound_tag() { jq -r --argjson i "$1" '.inbounds[$i].tag // ("inbound-" + ($i|tostring))' "$CONFIG"; }
-inbound_protocol() { jq -r --argjson i "$1" '.inbounds[$i].protocol // "unknown"' "$CONFIG"; }
-user_path() {
-  case "$1" in
-    hysteria2) printf '.settings.users' ;;
-    *) printf '.settings.clients' ;;
+install_sampler() {
+  command -v crontab >/dev/null 2>&1 || die "缺少 crontab，请安装 BusyBox。"
+  command -v crond >/dev/null 2>&1 || die "缺少 crond，请安装 BusyBox。"
+  case "$XRAY_DIR$CONFIG$STATE$XRAY_BIN$LOG_DIR$SERVICE" in
+    *"'"*|*'%'*|*'
+'*) die "定时任务路径不能包含单引号、百分号或换行。" ;;
   esac
-}
-user_count() {
-  path="$(user_path "$(inbound_protocol "$1")")"
-  jq -r --argjson i "$1" "$path // [] | length" "$CONFIG"
-}
-user_email() {
-  i="$1"; u="$2"; path="$(user_path "$(inbound_protocol "$i")")"
-  jq -r --argjson i "$i" --argjson u "$u" "$path[\$u].email // $path[\$u].name // (\"user-\" + (\$u|tostring))" "$CONFIG"
-}
-select_inbound() {
-  count="$(inbound_count)"
-  [ "$count" -gt 0 ] || die "配置中没有入站。"
-  echo "可用入站:"
-  i=0
-  while [ "$i" -lt "$count" ]; do
-    tag="$(inbound_tag "$i")"
-    proto="$(inbound_protocol "$i")"
-    listen="$(jq -r --argjson i "$i" '.inbounds[$i].listen // "0.0.0.0"' "$CONFIG")"
-    port="$(jq -r --argjson i "$i" '.inbounds[$i].port // "-"' "$CONFIG")"
-    printf '  %s) %s [%s] %s:%s\n' "$i" "$tag" "$proto" "$listen" "$port"
-    i=$((i + 1))
-  done
-  while :; do
-    choice="$(ask "选择入站编号")"
-    case "$choice" in ''|*[!0-9]*) ;; *) [ "$choice" -lt "$count" ] 2>/dev/null && { printf '%s' "$choice"; return; } ;; esac
-    echo "编号无效。" >&2
-  done
+  [ "$SELF" = "$RUNNER" ] || cp "$SELF" "$RUNNER"
+  chmod 700 "$RUNNER"
+  state_edit '.sampler=true'
+  {
+    crontab -l 2>/dev/null | awk '!/# xray-node-manager$/ && !/# xray-node-manager-boot$/'
+    printf "* * * * * XRAY_DIR='%s' CONFIG='%s' STATE='%s' XRAY_BIN='%s' LOG_DIR='%s' SERVICE='%s' '%s' --sample # xray-node-manager\n" \
+      "$XRAY_DIR" "$CONFIG" "$STATE" "$XRAY_BIN" "$LOG_DIR" "$SERVICE" "$RUNNER"
+  } | crontab -
+  rc-update add crond default
+  rc-service crond status >/dev/null 2>&1 || rc-service crond start
 }
 
-list_nodes() {
-  count="$(inbound_count)"
-  echo "配置: $CONFIG"
-  i=0
-  while [ "$i" -lt "$count" ]; do
-    tag="$(inbound_tag "$i")"; proto="$(inbound_protocol "$i")"
-    listen="$(jq -r --argjson i "$i" '.inbounds[$i].listen // "0.0.0.0"' "$CONFIG")"
-    port="$(jq -r --argjson i "$i" '.inbounds[$i].port // "-"' "$CONFIG")"
-    n="$(user_count "$i")"
-    printf '入站[%s] name=%s tag=%s protocol=%s listen=%s port=%s users=%s\n' "$i" "$tag" "$tag" "$proto" "$listen" "$port" "$n"
-    u=0
-    while [ "$u" -lt "$n" ]; do
-      printf '  user[%s] %s\n' "$u" "$(user_email "$i" "$u")"
-      u=$((u + 1))
-    done
-    i=$((i + 1))
-  done
-}
-
-ensure_stats() {
-  tmp="$(config_tmp)"
-  jq -e --arg tag "$API_TAG" --argjson port "$API_PORT" '
-    any(.inbounds[]?; (.tag // "") != $tag and (.port // 0) == $port)
-  ' "$CONFIG" >/dev/null &&
-    die "API 端口 $API_PORT 已被其他入站占用，请设置 API_PORT 后重试。"
-  api_index="$(jq -r --arg tag "$API_TAG" '(.inbounds // []) | to_entries[] | select(.value.tag == $tag) | .key' "$CONFIG" | head -n1)"
-  if [ -n "$api_index" ]; then
-    api_listen="$(jq -r --argjson i "$api_index" '.inbounds[$i].listen // "127.0.0.1"' "$CONFIG")"
-    case "$api_listen" in 127.0.0.1|localhost|::1) ;; *) die "已有 API 没有绑定到本机，拒绝继续以免暴露管理接口。" ;; esac
+enable_statistics() {
+  local tag api_tag
+  tag="$1"
+  api_tag="$(jq -r '.api.tag // "NodeStatsAPI"' "$TX/config.json")"
+  if jq -e '.api.tag != null' "$TX/config.json" >/dev/null; then
+    [ -n "$(api_address)" ] || die "已有 API 不是本机 dokodemo-door 入站，未自动改写。"
+  else
+    jq -e --arg tag "$api_tag" '
+      any(.inbounds[]?; .tag==$tag or .port==10085) or any(.outbounds[]?; .tag==$tag)
+    ' "$TX/config.json" >/dev/null && die "统计 API 名称或端口 10085 已占用。"
+    config_edit '
+      .inbounds += [{tag:$tag,listen:"127.0.0.1",port:10085,
+        protocol:"dokodemo-door",settings:{address:"127.0.0.1"}}] |
+      .outbounds = ((.outbounds // []) + [{tag:$tag,protocol:"freedom"}]) |
+      .routing.rules = [{type:"field",inboundTag:[$tag],outboundTag:$tag}] + (.routing.rules // [])
+    ' --arg tag "$api_tag"
   fi
-  jq --arg tag "$API_TAG" --argjson port "$API_PORT" '
-    .inbounds = (.inbounds // []) |
-    if any(.inbounds[]?; .tag == $tag) then . else
-      .inbounds += [{"listen":"127.0.0.1","port":$port,"protocol":"dokodemo-door",
-        "settings":{"address":"127.0.0.1"},"tag":$tag}] end |
-    .outbounds = (.outbounds // []) |
-    if any(.outbounds[]?; .tag == "api") then . else
-      .outbounds += [{"protocol":"freedom","tag":"api"}] end |
-    .routing = (.routing // {}) |
-    .routing.domainStrategy = (.routing.domainStrategy // "AsIs") |
-    .routing.rules = (.routing.rules // []) |
-    if any(.routing.rules[]?; .inboundTag? | index($tag)) then . else
-      .routing.rules += [{"type":"field","inboundTag":[$tag],"outboundTag":"api"}] end |
-    .api = (.api // {}) | .api.tag = $tag |
-    .api.services = ((.api.services // []) + ["StatsService","HandlerService"] | unique) |
-    .policy = (.policy // {}) |
-    .policy.levels = ((.policy.levels // {}) | with_entries(.value.stats = {"userUplink":true,"userDownlink":true})) |
-    .policy.system = ((.policy.system // {}) + {"statsInboundUplink":true,"statsInboundDownlink":true})
-  ' "$CONFIG" > "$tmp"
-  commit_config "$tmp"
+  config_edit '
+    .api.tag=$tag | .api.services=((.api.services // [])+["StatsService"] | unique) |
+    .stats=(.stats // {}) |
+    .policy.system.statsInboundUplink=true | .policy.system.statsInboundDownlink=true
+  ' --arg tag "$api_tag"
+  state_edit '.nodes[$tag].statistics=true' --arg tag "$tag"
+  install_sampler
+  apply
+  echo "节点字节统计已开启；每分钟保存一次上下行累计值。"
 }
 
-show_credentials() {
-  i="$(select_inbound)"
-  n="$(user_count "$i")"
-  [ "$n" -gt 0 ] || die "该入站没有用户。"
-  u="$(ask "用户编号（0-$((n - 1))）")"
-  case "$u" in ''|*[!0-9]*) die "编号无效。" ;; esac
-  [ "$u" -lt "$n" ] || die "编号无效。"
-  yesno "这会显示敏感凭据，并可能被终端记录。确认显示？" || return 0
-  proto="$(inbound_protocol "$i")"
-  jq -r --argjson i "$i" --argjson u "$u" --arg proto "$proto" '
-    if $proto == "hysteria2" then .inbounds[$i].settings.users[$u]
-    else .inbounds[$i].settings.clients[$u] end
-  ' "$CONFIG"
-}
-
-add_user() {
-  i="$(select_inbound)"; proto="$(inbound_protocol "$i")"
-  email="$(ask "用户标识/email（仅字母、数字、._@-）")"
-  valid_email "$email" || die "用户标识为空或包含不允许的字符。"
-  path="$(user_path "$i")"
-  jq -e --argjson i "$i" --arg email "$email" "$path // [] | any(.[]?; (.email // .name // \"\") == \$email)" "$CONFIG" >/dev/null &&
-    die "该入站中已存在同名用户。"
-  case "$proto" in
-    vless|vmess|trojan)
-      id="$("$XRAY_BIN" uuid)"
-      tmp="$(config_tmp)"
-      jq --argjson i "$i" --arg email "$email" --arg id "$id" '
-        .inbounds[$i].settings.clients = (.inbounds[$i].settings.clients // []) +
-        [{"id":$id,"email":$email}]
-      ' "$CONFIG" > "$tmp"
-      commit_config "$tmp"
-      echo "新增用户: $email"
-      echo "UUID: $id"
-      ;;
-    hysteria2)
-      auth="$(openssl rand -base64 24 | tr -d '=+/')"
-      tmp="$(config_tmp)"
-      jq --argjson i "$i" --arg email "$email" --arg auth "$auth" '
-        .inbounds[$i].settings.users = (.inbounds[$i].settings.users // []) +
-        [{"name":$email,"password":$auth}]
-      ' "$CONFIG" > "$tmp"
-      commit_config "$tmp"
-      echo "新增用户: $email"
-      echo "密码: $auth"
-      ;;
-    shadowsocks)
-      jq -e --argjson i "$i" '.inbounds[$i].settings.password? != null and (.inbounds[$i].settings.clients? == null)' "$CONFIG" >/dev/null &&
-        die "当前 Shadowsocks 是单密码模式；为避免错误配置，未自动转换，请先改成 clients 多用户模式。"
-      password="$(openssl rand -base64 24 | tr -d '=+/')"
-      tmp="$(config_tmp)"
-      jq --argjson i "$i" --arg email "$email" --arg password "$password" '
-        .inbounds[$i].settings.clients = (.inbounds[$i].settings.clients // []) +
-        [{"password":$password,"email":$email}]
-      ' "$CONFIG" > "$tmp"
-      commit_config "$tmp"
-      echo "新增用户: $email"
-      echo "密码: $password"
-      ;;
-    *) die "暂不支持为协议 $proto 添加用户。" ;;
-  esac
-  echo "请立即保存以上凭据；列表默认不会再次显示秘密。"
-}
-
-delete_user() {
-  i="$(select_inbound)"; proto="$(inbound_protocol "$i")"; n="$(user_count "$i")"
-  [ "$n" -gt 0 ] || die "该入站没有用户。"
-  u="$(ask "要删除的用户编号（0-$((n - 1))）")"
-  case "$u" in ''|*[!0-9]*) die "编号无效。" ;; esac
-  [ "$u" -lt "$n" ] || die "编号无效。"
-  email="$(user_email "$i" "$u")"
-  yesno "将删除 $(inbound_tag "$i") 上的 $email，确认吗？" || return 0
-  path="$(user_path "$i")"; tmp="$(config_tmp)"
-  jq --argjson i "$i" --argjson u "$u" "$path = ($path // [] | del(.[$u]))" "$CONFIG" > "$tmp"
-  commit_config "$tmp"
-  tag="$(inbound_tag "$i")"
-  jq --arg key "$tag::$email" 'del(.users[$key])' "$STATE" > "$STATE.tmp.$$"
-  mv "$STATE.tmp.$$" "$STATE"; chmod 600 "$STATE"
-}
-
-set_limit() {
-  i="$(select_inbound)"; tag="$(inbound_tag "$i")"; n="$(user_count "$i")"
-  [ "$n" -gt 0 ] || die "该入站没有用户。"
-  u="$(ask "用户编号（0-$((n - 1))）")"
-  case "$u" in ''|*[!0-9]*) die "编号无效。" ;; esac
-  [ "$u" -lt "$n" ] || die "编号无效。"
-  email="$(user_email "$i" "$u")"
-  quota="$(ask "月流量上限，单位 GiB，0 表示不限")"; positive_or_zero "$quota" || die "请输入非负整数。"
-  online="$(ask "最大在线数，0 表示不限；这是周期检查软限制")"; positive_or_zero "$online" || die "请输入非负整数。"
-  month="$(date +%Y-%m)"
-  jq --arg key "$tag::$email" --arg tag "$tag" --arg email "$email" --arg month "$month" \
-    --argjson quota "$quota" --argjson online "$online" '
-    .users = (.users // {}) |
-    .users[$key] = ((.users[$key] // {}) + {inbound_tag:$tag,email:$email,quota_gib:$quota,max_online:$online,month:$month,base_bytes:0,disabled:false})
-  ' "$STATE" > "$STATE.tmp.$$"
-  mv "$STATE.tmp.$$" "$STATE"; chmod 600 "$STATE"
-  echo "限制已保存：$tag::$email"
+enable_logging() {
+  local tag existing
+  tag="$1"
+  echo "只记录目标域名/IP:端口和连接状态，不记录路径、正文或精确包数。"
+  echo "Xray 原始访问日志是全局的；采样任务按精确入站标签分流为节点日志。"
+  confirm "开启 $tag 的日志？" || return 0
+  existing="$(jq -r '.log.access // ""' "$TX/config.json")"
+  case "$existing" in ""|none|"$LOG_DIR/access.log") ;; *) die "已有自定义访问日志 $existing，未自动覆盖。";; esac
+  mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
+  touch "$LOG_DIR/access.log"; chmod 600 "$LOG_DIR/access.log"
+  config_edit '.log.access=$path | .log.dnsLog=false' --arg path "$LOG_DIR/access.log"
+  state_edit '.nodes[$tag].logging=true' --arg tag "$tag"
+  install_sampler
+  apply
+  echo "节点日志: $LOG_DIR/$tag-connections.log"
 }
 
 show_stats() {
-  get_api_addr >/dev/null || die "尚未启用本地统计 API，请先选择菜单 2。"
-  "$XRAY_BIN" api statsquery --server "$API_ADDR" 2>/dev/null || die "统计查询失败，请确认 API 已启用且服务正常。"
-}
-get_api_addr() {
-  API_ADDR="$(jq -r --arg tag "$API_TAG" '
-    (.inbounds // [])[] | select(.tag == $tag) |
-    ((.listen // "127.0.0.1") + ":" + ((.port // 10085)|tostring))
-  ' "$CONFIG" | head -n1)"
-  [ -n "${API_ADDR:-}" ] || return 1
-  api_host="${API_ADDR%:*}"
-  case "$api_host" in 127.0.0.1|localhost|::1) return 0 ;; *) return 1 ;; esac
+  local tag
+  tag="$1"
+  jq -r --arg tag "$tag" '
+    .nodes[$tag] |
+    "统计开关: \(.statistics // false)",
+    "累计上行: \(.upload_bytes // 0) 字节",
+    "累计下行: \(.download_bytes // 0) 字节",
+    "最近采样: \(.sampled_at // "尚未采样")",
+    "连接上限: \(.max_connections // 0) (0=无限制)",
+    "节点日志: \(.logging // false)"
+  ' "$TX/state.json"
+  if [ -r "$LOG_DIR/$tag-connections.log" ]; then
+    echo "最近 30 条目标连接记录:"
+    tail -n 30 "$LOG_DIR/$tag-connections.log"
+  fi
 }
 
-install_checker() {
-  cat > "$CHECKER" <<'EOF'
-#!/bin/sh
-set -eu
-umask 077
-XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
-XRAY_DIR="${XRAY_DIR:-/etc/xray}"
-CONFIG="$XRAY_DIR/config.json"
-STATE="$XRAY_DIR/manager-state.json"
-SERVICE="${SERVICE:-xray}"
-LOCK_DIR="$XRAY_DIR/.manager.lock"
-[ -r "$CONFIG" ] && [ -r "$STATE" ] || exit 0
-command -v jq >/dev/null 2>&1 || exit 0
-mkdir "$LOCK_DIR" 2>/dev/null || exit 0
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
-month="$(date +%Y-%m)"
-tmp="$CONFIG.tmp.$$"
-changed=0
-api_addr="$(jq -r '
-  (.inbounds // [])[] | select(.tag == "api") |
-  ((.listen // "127.0.0.1") + ":" + ((.port // 10085)|tostring))
-' "$CONFIG" | head -n1)"
-case "${api_addr%:*}" in 127.0.0.1|localhost|::1) ;; *) exit 0 ;; esac
-while IFS="$(printf '\t')" read -r key tag email quota online base saved_month disabled; do
-  [ -n "$key" ] || continue
-  [ "$disabled" = "true" ] && continue
-  [ "$saved_month" = "$month" ] || {
-    jq --arg key "$key" --arg month "$month" '.users[$key].month=$month | .users[$key].base_bytes=0' "$STATE" > "$STATE.tmp.$$"
-    mv "$STATE.tmp.$$" "$STATE"; continue
-  }
-  [ "$quota" -gt 0 ] 2>/dev/null || continue
-  # The stats API is queried only when configured; quota enforcement is conservative.
-  used="$( "$XRAY_BIN" api stats --server "$api_addr" -name "user>>>${email}>>>traffic>>>downlink" 2>/dev/null | awk '/value:/ {print $2}' | tail -n1 )" || used=0
-  case "$used" in ''|*[!0-9]*) used=0 ;; esac
-  limit=$((quota * 1073741824))
-  if [ "$used" -ge "$limit" ]; then
-    jq --arg tag "$tag" --arg email "$email" '
-      .inbounds = [.inbounds[] | if .tag == $tag then
-        if .protocol == "hysteria2" then
-          .settings.users = [(.settings.users // [])[] | select((.name // .email // "") != $email)]
-        else
-          .settings.clients = [(.settings.clients // [])[] | select((.email // .name // "") != $email)]
-        end
-      else . end]
-    ' "$CONFIG" > "$tmp"
-    "$XRAY_BIN" run -test -format json -config "$tmp" >/dev/null || continue
-    backup="$CONFIG.bak.quota.$(date +%Y%m%d%H%M%S).$$"
-    cp "$CONFIG" "$backup"
-    chmod 600 "$backup"
-    mv "$tmp" "$CONFIG"; changed=1
-    if command -v rc-service >/dev/null 2>&1 &&
-       ! rc-service "$SERVICE" restart >/dev/null 2>&1; then
-      cp "$backup" "$CONFIG"
-      chmod 600 "$CONFIG"
-      rc-service "$SERVICE" restart >/dev/null 2>&1 || true
-      changed=0
-      continue
+tcp_limit_supported() {
+  local proto network transport port count
+  proto="$(node_value "$1" '.protocol')"
+  network="$(node_value "$1" '.settings.network // "tcp,udp"')"
+  transport="$(node_value "$1" '.streamSettings.network // "tcp"')"
+  case "$proto:$network:$transport" in
+    vless:*:tcp|vless:*:raw|shadowsocks:tcp:tcp) ;;
+    *) die "此版本仅支持 TCP VLESS/SS 的连接数软限制；HY2、UDP 或其他传输不接受非零上限。" ;;
+  esac
+  port="$(node_value "$1" '.port')"
+  valid_port "$port" || die "连接限制要求单个数值监听端口。"
+  count="$(jq --argjson port "$port" '[.nodes[].inbound | select(.port==$port)] | length' "$TX/state.json")"
+  [ "$count" -eq 1 ] || die "多个节点共享此端口，不能可靠按节点计数。"
+}
+
+set_max_connections() {
+  local tag value port
+  tag="$1"
+  value="$(ask "最大连接数，0=无限制；当前 $(state_value "$tag" '.max_connections // 0')")"
+  valid_number "$value" || die "请输入非负整数（不要加前导零）。"
+  if [ "$value" -gt 0 ]; then
+    tcp_limit_supported "$tag"
+    port="$(node_value "$tag" '.port')"
+    command -v ss >/dev/null 2>&1 || die "缺少 ss，请执行 apk add --no-cache iproute2-ss。"
+    ss -Hnt state established "sport = :$port" > "$TX/connections.txt" ||
+      die "当前环境无法读取 TCP 连接。"
+    echo "每分钟检查本机该端口的 ESTABLISHED TCP 连接；超限会停用整个节点，需手动启用。"
+    echo "不是按 IP 限制，不是即时拒绝新连接，不计 Mux 内部逻辑流，也不代表人数。"
+    confirm "使用此软限制策略？" || return 0
+    install_sampler
+  fi
+  state_edit '.nodes[$tag].max_connections=$value' --arg tag "$tag" --argjson value "$value"
+  save_only
+  echo "连接上限已保存。"
+}
+
+check_limits() {
+  local changed tag port count max
+  command -v ss >/dev/null 2>&1 || return 0
+  changed=0
+  for tag in $(jq -r '.nodes | to_entries[] |
+    select(.value.disabled!=true and (.value.max_connections // 0)>0) | .key' "$TX/state.json"); do
+    port="$(node_value "$tag" '.port')"
+    valid_port "$port" || continue
+    ss -Hnt state established "sport = :$port" > "$TX/connections.txt" ||
+      { echo "无法读取 $tag 的连接数，未判为零。" >&2; continue; }
+    count="$(wc -l < "$TX/connections.txt" | tr -d ' ')"
+    max="$(state_value "$tag" '.max_connections')"
+    if [ "$count" -gt "$max" ]; then
+      state_edit '.nodes[$tag].disabled=true | .nodes[$tag].disabled_reason="connection_limit"' --arg tag "$tag"
+      persist_node "$tag"
+      changed=1
+      printf '%s 节点 %s 连接数 %s > %s，停用节点。\n' "$(date -u +%FT%TZ)" "$tag" "$count" "$max" >&2
     fi
-    jq --arg key "$key" '.users[$key].disabled=true | .users[$key].disabled_reason="monthly quota exceeded"' "$STATE" > "$STATE.tmp.$$"
-    mv "$STATE.tmp.$$" "$STATE"
-  fi
-done <<EOF_USERS
-$(jq -r '.users // {} | to_entries[] | [.key,.value.inbound_tag,.value.email,(.value.quota_gib//0),(.value.max_online//0),(.value.base_bytes//0),(.value.month//""),(.value.disabled//false)] | @tsv' "$STATE")
-EOF_USERS
-chmod 600 "$CONFIG" "$STATE"
-EOF
-  chmod 700 "$CHECKER"
-  if command -v crond >/dev/null 2>&1; then
-    mkdir -p /etc/periodic/hourly
-    ln -sf "$CHECKER" /etc/periodic/hourly/xray-quota-check
-    rc-service crond start >/dev/null 2>&1 || true
-    rc-update add crond default >/dev/null 2>&1 || true
-  fi
-  echo "检查任务已安装: $CHECKER"
-  echo "说明：配额是周期检查软限制；达到上限后会移除对应入站中的用户并重载。"
+  done
+  if [ "$changed" -eq 1 ]; then apply; else save_only; fi
 }
 
-restore_backup() {
-  latest="$(ls -1t "$CONFIG".bak.* 2>/dev/null | head -n1 || true)"
-  [ -n "$latest" ] || die "没有找到备份。"
-  "$XRAY_BIN" run -test -format json -config "$latest" >/dev/null || die "备份配置检查失败，未恢复。"
-  current="${CONFIG}.restore-current.$$"
-  cp "$CONFIG" "$current"; chmod 600 "$current"
-  cp "$latest" "$CONFIG"; chmod 600 "$CONFIG"
-  if ! restart_service; then cp "$current" "$CONFIG"; chmod 600 "$CONFIG"; restart_service >/dev/null 2>&1 || true; die "恢复后重启失败，已回滚。"; fi
-  rm -f "$current"
-  echo "已恢复: $latest"
+show_link() {
+  local tag host port proto id flow sni sid private public method password userinfo
+  tag="$1"
+  confirm "导入链接包含节点凭据，显示 $tag 的链接？" || return 0
+  host="$(state_value "$tag" '.public_host // ""')"
+  port="$(state_value "$tag" '.public_port // ""')"
+  if [ -z "$host" ]; then
+    host="$(ask "客户端公网地址（域名/IP）")"
+    valid_host "$host" || die "地址格式无效。"
+  fi
+  if [ -z "$port" ]; then
+    port="$(ask "外部访问端口（NAT 填外部映射，不猜测内部端口）")"
+    valid_port "$port" || die "端口无效。"
+  fi
+  state_edit '.nodes[$tag].public_host=$host | .nodes[$tag].public_port=$port' \
+    --arg tag "$tag" --arg host "$host" --argjson port "$port"
+  save_only
+  case "$host" in *:*) host="[$host]" ;; esac
+  proto="$(node_value "$tag" '.protocol')"
+  case "$proto" in
+    vless)
+      [ "$(node_value "$tag" '.streamSettings.security')" = reality ] ||
+        die "当前仅生成 VLESS+Reality 链接。"
+      [ "$(node_value "$tag" '.settings.clients | length')" -eq 1 ] ||
+        die "此节点有多个凭据，无法对应唯一链接；此管理器不管理单独用户。"
+      id="$(node_value "$tag" '.settings.clients[0].id')"
+      flow="$(node_value "$tag" '.settings.clients[0].flow // ""')"
+      sni="$(node_value "$tag" '.streamSettings.realitySettings.serverNames[0]')"
+      sid="$(node_value "$tag" '.streamSettings.realitySettings.shortIds[0] // ""')"
+      private="$(node_value "$tag" '.streamSettings.realitySettings.privateKey')"
+      public="$("$XRAY_BIN" x25519 -i "$private" | awk -F: '
+        {key=tolower($1); gsub(/[[:space:]()]/,"",key)}
+        key=="publickey" || key=="passwordpublickey" || key=="password" {
+          gsub(/[[:space:]]/,"",$2); print $2; exit
+        }')"
+      [ -n "$public" ] || die "无法从 Reality 私钥推导公钥。"
+      printf 'vless://%s@%s:%s?encryption=none&flow=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
+        "$(uri "$id")" "$host" "$port" "$(uri "$flow")" "$(uri "$sni")" "$(uri "$public")" "$(uri "$sid")" "$tag"
+      ;;
+    shadowsocks)
+      method="$(node_value "$tag" '.settings.method // ""')"
+      password="$(node_value "$tag" '.settings.password // ""')"
+      [ -n "$method" ] && [ -n "$password" ] || die "不是单密码 SS 节点，无法生成唯一链接。"
+      userinfo="$(printf '%s' "$method:$password" | base64 | tr '+/' '-_' | tr -d '\n=')"
+      printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$host" "$port" "$tag"
+      ;;
+    hysteria)
+      [ "$(node_value "$tag" '.settings.users | length')" -eq 1 ] ||
+        die "HY2 节点必须只有一份认证凭据。"
+      password="$(node_value "$tag" '.settings.users[0].auth // ""')"
+      sni="$(state_value "$tag" '.sni // ""')"
+      if [ -z "$sni" ]; then
+        sni="$(ask "HY2 证书域名/SNI（必须匹配已有可信证书）")"
+        valid_sni "$sni" || die "域名格式无效。"
+        state_edit '.nodes[$tag].sni=$sni' --arg tag "$tag" --arg sni "$sni"
+        save_only
+      fi
+      [ -n "$password" ] || die "HY2 auth 缺失。"
+      printf 'hysteria2://%s@%s:%s/?sni=%s#%s\n' "$(uri "$password")" "$host" "$port" "$(uri "$sni")" "$tag"
+      ;;
+    *) die "不支持此协议的链接。" ;;
+  esac
 }
 
-check_config() { "$XRAY_BIN" run -test -format json -config "$CONFIG"; }
+set_enabled() {
+  local tag disabled
+  tag="$1"; disabled="$2"
+  state_edit '.nodes[$tag].disabled=$disabled | .nodes[$tag].disabled_reason=
+    (if $disabled then "manual" else null end)' --arg tag "$tag" --argjson disabled "$disabled"
+  persist_node "$tag"
+  apply
+  echo "节点状态已更新；重载服务会中断此 Xray 进程的现有连接。"
+}
+
+rename_node() {
+  local tag new
+  tag="$1"; new="$(ask "新名称（英文字母开头，后续仅字母和数字）")"
+  valid_name "$new" || die "名称无效。"
+  [ "$new" != "$tag" ] || return 0
+  [ ! -e "$LOG_DIR/$new-connections.log" ] || die "新名称日志已存在，请先处理: $LOG_DIR/$new-connections.log"
+  jq -e --arg new "$new" '
+    .nodes[$new]!=null or any(.nodes[]; .inbound.tag==($new+"Out"))
+  ' "$TX/state.json" >/dev/null && die "节点名称已存在。"
+  jq -e --arg new "$new" 'any(.inbounds[]?; .tag==$new or .tag==($new+"Out")) or
+    any(.outbounds[]?; .tag==$new or .tag==($new+"Out"))' "$TX/config.json" >/dev/null &&
+    die "新名称或关联出口名称冲突。"
+  config_edit '
+    .inbounds |= map(if .tag==$old then .tag=$new else . end) |
+    .outbounds = ((.outbounds // []) | map(if .tag==($old+"Out") then .tag=($new+"Out") else . end)) |
+    walk(if type=="object" then
+      (if (.inboundTag? | type)=="array" then .inboundTag |= map(if .==$old then $new else . end) else . end) |
+      (if .outboundTag?==($old+"Out") then .outboundTag=($new+"Out") else . end) |
+      (if .dialerProxy?==($old+"Out") then .dialerProxy=($new+"Out") else . end) |
+      (if .proxySettings?.tag==($old+"Out") then .proxySettings.tag=($new+"Out") else . end)
+    else . end)
+  ' --arg old "$tag" --arg new "$new"
+  state_edit '
+    .nodes[$new]=.nodes[$old] | .nodes[$new].inbound.tag=$new | del(.nodes[$old])
+  ' --arg old "$tag" --arg new "$new"
+  apply
+  if [ -e "$LOG_DIR/$tag-connections.log" ]; then
+    mv "$LOG_DIR/$tag-connections.log" "$LOG_DIR/$new-connections.log"
+  fi
+  echo "已改名为 $new，请重新显示导入链接。"
+}
+
+delete_node() {
+  local tag
+  tag="$1"
+  confirm "永久删除 $tag 的配置与凭据？不生成备份，已有日志保留。" || return 0
+  config_edit '
+    .inbounds |= map(select(.tag!=$tag)) |
+    .routing.rules = [(.routing.rules // [])[] |
+      if (.inboundTag? | type)=="array" and (.inboundTag | index($tag))!=null
+      then .inboundTag |= map(select(.!=$tag)) | select(.inboundTag | length>0) else . end] |
+    ([.. | objects | .outboundTag?, .dialerProxy?, .proxySettings?.tag?] |
+      any(.==($tag+"Out"))) as $used |
+    if $used then . else .outbounds = [(.outbounds // [])[] | select(.tag!=($tag+"Out"))] end
+  ' --arg tag "$tag"
+  state_edit 'del(.nodes[$tag])' --arg tag "$tag"
+  if ! jq -e 'any(.nodes[]; .logging==true)' "$TX/state.json" >/dev/null &&
+     [ "$(jq -r '.log.access // ""' "$TX/config.json")" = "$LOG_DIR/access.log" ]; then
+    config_edit '.log.access="none"'
+  fi
+  apply
+  echo "节点已删除。"
+}
+
+edit_config() {
+  local tag value proto cert host port password
+  tag="$1"
+  echo "1. 内部监听端口"
+  echo "2. 外部访问/映射端口"
+  echo "3. 客户端公网地址"
+  echo "4. SNI / Reality 目标"
+  echo "5. UUID / 节点密码"
+  echo "6. 节点名称"
+  echo "7. 中转出口的 SS 地址/端口/密码"
+  echo "0. 返回"
+  case "$(ask "选择配置项目")" in
+    1)
+      value="$(ask "新的内部端口（当前 $(node_value "$tag" '.port')）")"
+      valid_port "$value" || die "端口无效。"
+      jq -e --arg tag "$tag" --argjson port "$value" '
+        any(.nodes | to_entries[]; .key!=$tag and .value.inbound.port==$port)
+      ' "$TX/state.json" >/dev/null && die "端口已被另一节点保留。"
+      jq -e --arg tag "$tag" --argjson port "$value" '
+        any(.inbounds[]; .tag!=$tag and
+          ((.port | type)!="number" or .port==$port))
+      ' "$TX/config.json" >/dev/null && die "配置端口冲突或存在无法自动检查的端口范围。"
+      state_edit '.nodes[$tag].inbound.port=$value' --arg tag "$tag" --argjson value "$value"
+      persist_node "$tag"; apply
+      echo "内部端口已修改，外部映射未改变；请同步服务商 NAT 映射。"
+      ;;
+    2)
+      value="$(ask "新的外部端口（当前 $(state_value "$tag" '.public_port // "未设置"')）")"
+      valid_port "$value" || die "端口无效。"
+      state_edit '.nodes[$tag].public_port=$value' --arg tag "$tag" --argjson value "$value"; save_only
+      ;;
+    3)
+      value="$(ask "新的客户端公网地址")"; valid_host "$value" || die "地址无效。"
+      state_edit '.nodes[$tag].public_host=$value' --arg tag "$tag" --arg value "$value"; save_only
+      ;;
+    4)
+      proto="$(node_value "$tag" '.protocol')"
+      value="$(ask "新的 SNI")"; valid_sni "$value" || die "域名无效，禁止 Cloudflare。"
+      case "$proto" in
+        vless)
+          [ "$(node_value "$tag" '.streamSettings.security')" = reality ] || die "不是 Reality 节点。"
+          state_edit '.nodes[$tag].inbound.streamSettings.realitySettings |=
+            (.serverNames=[$value] | .dest=($value+":443") | if has("target") then .target=($value+":443") else . end)' \
+            --arg tag "$tag" --arg value "$value"
+          persist_node "$tag"; apply
+          echo "已更新 SNI 与目标；请确认新目标支持 Reality 所需 TLS 特性。"
+          ;;
+        hysteria)
+          command -v openssl >/dev/null 2>&1 || die "缺少 openssl。"
+          cert="$(node_value "$tag" '.streamSettings.tlsSettings.certificates[0].certificateFile // ""')"
+          [ -r "$cert" ] || die "证书文件不可读。"
+          openssl x509 -in "$cert" -noout -checkhost "$value" >/dev/null || die "新域名与现有证书不匹配，未修改。"
+          state_edit '.nodes[$tag].sni=$value' --arg tag "$tag" --arg value "$value"; save_only
+          ;;
+        *) die "SS 没有 SNI。" ;;
+      esac
+      ;;
+    5)
+      value="$(ask "输入新 UUID/密码（更改后旧链接失效）")"
+      [ -n "$value" ] || die "不能为空。"
+      case "$(node_value "$tag" '.protocol')" in
+        vless)
+          printf '%s\n' "$value" | grep -Eq '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$' || die "UUID 格式无效。"
+          [ "$(node_value "$tag" '.settings.clients | length')" -eq 1 ] || die "多个凭据的节点不提供此快捷修改。"
+          state_edit '.nodes[$tag].inbound.settings.clients[0].id=$value' --arg tag "$tag" --arg value "$value" ;;
+        shadowsocks)
+          [ "$(node_value "$tag" '.settings.password // ""')" != "" ] || die "不是单密码 SS。"
+          state_edit '.nodes[$tag].inbound.settings.password=$value' --arg tag "$tag" --arg value "$value" ;;
+        hysteria)
+          [ "$(node_value "$tag" '.settings.users | length')" -eq 1 ] || die "多个凭据的节点不提供此快捷修改。"
+          state_edit '.nodes[$tag].inbound.settings.users[0].auth=$value' --arg tag "$tag" --arg value "$value" ;;
+      esac
+      persist_node "$tag"; apply
+      ;;
+    6) rename_node "$tag" ;;
+    7)
+      jq -e --arg tag "$tag" 'any(.outbounds[]?; .tag==($tag+"Out") and .protocol=="shadowsocks")' "$TX/config.json" >/dev/null ||
+        die "没有此节点专属的 SS 中转出口。"
+      host="$(ask "落地公网地址")"; valid_host "$host" || die "地址无效。"
+      port="$(ask "落地外部 SS 端口")"; valid_port "$port" || die "端口无效。"
+      password="$(ask "落地 SS 密码")"; [ -n "$password" ] || die "密码不能为空。"
+      config_edit '.outbounds |= map(if .tag==($tag+"Out") then
+        .settings.servers[0] |= (.address=$host | .port=$port | .password=$password) else . end)' \
+        --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg password "$password"
+      apply
+      ;;
+    0) ;;
+    *) echo "无效选项。" ;;
+  esac
+}
+
+run_action() {
+  local action tag
+  action="$1"; tag="$2"
+  begin
+  [ -n "$(node "$tag")" ] || die "节点不存在。"
+  sample_stats
+  sample_logs
+  case "$action" in
+    link) show_link "$tag" ;;
+    stats) show_stats "$tag"; save_only ;;
+    enable_stats) enable_statistics "$tag" ;;
+    enable_logs) enable_logging "$tag" ;;
+    disable_logs)
+      state_edit '.nodes[$tag].logging=false' --arg tag "$tag"
+      if ! jq -e 'any(.nodes[]; .logging==true)' "$TX/state.json" >/dev/null &&
+         [ "$(jq -r '.log.access // ""' "$TX/config.json")" = "$LOG_DIR/access.log" ]; then
+        config_edit '.log.access="none"'; apply
+      else save_only; fi
+      echo "已停止此节点日志分流；其他节点开启日志时，全局原始日志仍包含此节点连接。" ;;
+    max) set_max_connections "$tag" ;;
+    edit) edit_config "$tag" ;;
+    rename) rename_node "$tag" ;;
+    enable) set_enabled "$tag" false ;;
+    disable) set_enabled "$tag" true ;;
+    delete) delete_node "$tag" ;;
+  esac
+}
+
+list_nodes() {
+  {
+    [ ! -r "$STATE" ] || jq -c '.nodes // {} | to_entries[] | {tag:.key, protocol:.value.inbound.protocol,
+      port:.value.inbound.port, disabled:(.value.disabled // false)}' "$STATE"
+    jq -c '.inbounds[] | select(.protocol=="vless" or .protocol=="shadowsocks" or .protocol=="hysteria") |
+      {tag,protocol,port,disabled:false}' "$CONFIG"
+  } | jq -rs '
+    group_by(.tag) | .[] | last |
+    "\(.tag)  [\(.protocol)] 内部端口=\(.port)  \(if .disabled then "停用" else "启用" end)"
+  '
+}
 
 main() {
-  need_root; need_tools; acquire_lock
+  need_tools
+  if [ "${1:-}" = --action ]; then
+    [ "$#" -eq 3 ] || die "操作参数不完整。"
+    valid_name "$3" || die "节点名称无效。"
+    case "$2" in
+      link|stats|enable_stats|enable_logs|disable_logs|max|edit|rename|enable|disable|delete)
+        run_action "$2" "$3" ;;
+      *) die "未知操作。" ;;
+    esac
+    exit 0
+  fi
+  if [ "${1:-}" = --sample ]; then
+    begin background
+    sample_stats; sample_logs; check_limits
+    exit 0
+  fi
   while :; do
     echo
-    echo "Xray 管理器 | 配置: $CONFIG | 服务: $SERVICE"
-    if get_api_addr; then echo "本地 API: $API_ADDR"; else echo "本地 API: 未启用"; fi
-    echo "1. 查看节点和用户"
-    echo "2. 启用流量统计与本地 API"
-    echo "3. 添加用户"
-    echo "4. 删除用户"
-    echo "5. 设置用户限制"
-    echo "6. 查看当前统计"
-    echo "7. 安装/更新月度检查任务"
-    echo "8. 查看单个用户凭据"
-    echo "9. 检查当前配置"
-    echo "10. 恢复最近一次备份"
+    echo "Xray 节点管理器"
+    list_nodes
+    echo "1. 选择节点"
+    echo "2. 检查当前配置"
     echo "0. 退出"
-    choice="$(ask "请选择")"
-    case "$choice" in
-      1) list_nodes ;;
-      2) ensure_stats ;;
-      3) add_user ;;
-      4) delete_user ;;
-      5) set_limit ;;
-      6) show_stats ;;
-      7) install_checker ;;
-      8) show_credentials ;;
-      9) check_config ;;
-      10) restore_backup ;;
+    case "$(ask "选择")" in
       0) exit 0 ;;
+      2) "$XRAY_BIN" run -test -format json -config "$CONFIG" ;;
+      1)
+        tag="$(ask "节点名称")"
+        valid_name "$tag" || { echo "名称必须以字母开头，后续仅字母和数字。"; continue; }
+        echo "节点: $tag"
+        echo "1. 显示导入链接"
+        echo "2. 查看流量统计与连接日志"
+        echo "3. 开通节点流量统计"
+        echo "4. 开启节点连接日志"
+        echo "5. 关闭节点连接日志"
+        echo "6. 设置最大连接数（0=无限制）"
+        echo "7. 修改节点配置"
+        echo "8. 改名"
+        echo "9. 停用"
+        echo "10. 启用"
+        echo "11. 删除"
+        echo "0. 返回"
+        case "$(ask "选择节点操作")" in
+          1) action=link ;; 2) action=stats ;; 3) action=enable_stats ;;
+          4) action=enable_logs ;; 5) action=disable_logs ;; 6) action=max ;;
+          7) action=edit ;; 8) action=rename ;; 9) action=disable ;;
+          10) action=enable ;; 11) action=delete ;; 0) continue ;;
+          *) echo "无效选项。"; continue ;;
+        esac
+        sh "$SELF" --action "$action" "$tag" || echo "操作未完成，请查看上面的提示。"
+        ;;
       *) echo "无效选项。" ;;
     esac
   done
