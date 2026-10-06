@@ -6,7 +6,7 @@ set -eu
 #   1 direct  - VLESS+Reality or Hysteria2 -> freedom
 #   2 relay   - relay (VLESS+Reality or Hysteria2 -> SS) or landing (SS -> freedom)
 
-XRAY_DIR="${XRAY_DIR:-/usr/local/etc/xray}"
+XRAY_DIR="${XRAY_DIR:-/etc/xray}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 SERVICE_NAME="xray"
 WORK_DIR=""
@@ -82,6 +82,21 @@ ask_secret() {
     echo "密钥包含不安全字符，请使用字母、数字和常见密码字符。" >&2
   done
 }
+fetch_to() {
+  output="$1"; url="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --connect-timeout 10 --max-time 180 --retry 1 -o "$output" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$output" "$url"
+  else
+    return 1
+  fi
+}
+fetch_text() {
+  output="$1"; url="$2"
+  fetch_to "$output" "$url"
+  tr -d '\r' < "$output"
+}
 rand_hex() { openssl rand -hex "$1"; }
 rand_password() { openssl rand -base64 24 | tr -d '=+/'; }
 sni_valid() {
@@ -113,11 +128,18 @@ probe_sni() {
     echo "$host: 证书消息 ${cert_bytes} 字节，超过保守阈值 7000，跳过。" >&2
     return 1
   fi
-  speed="$(curl --noproxy '*' --connect-timeout 5 --max-time 10 \
-    --tlsv1.3 --tls-max 1.3 -sS -o /dev/null -w '%{time_appconnect}' \
-    "https://$host/" 2>/dev/null)" || {
-      echo "$host: HTTPS 测速失败，跳过。" >&2; return 1;
+  if command -v curl >/dev/null 2>&1; then
+    speed="$(curl --noproxy '*' --connect-timeout 5 --max-time 10 \
+      --tlsv1.3 --tls-max 1.3 -sS -o /dev/null -w '%{time_appconnect}' \
+      "https://$host/" 2>/dev/null)" || {
+        echo "$host: HTTPS 测速失败，跳过。" >&2; return 1;
+      }
+  else
+    speed="999.000000"
+    wget -q --timeout=10 --tries=1 -O /dev/null "https://$host/" 2>/dev/null || {
+      echo "$host: HTTPS 测试失败，跳过。" >&2; return 1;
     }
+  fi
   printf '%s\n' "$speed" | grep -Eq '^[0-9]+\.[0-9]+$' || return 1
   echo "$host: 通过；TLS 建连 ${speed}s；证书消息 ${cert_bytes} 字节。" >&2
   printf '%s\t%s\n' "$speed" "$host"
@@ -191,7 +213,7 @@ reality_key_field() {
 detect_public_host() {
   public_host=""
   for endpoint in https://api.ipify.org https://ifconfig.me/ip; do
-    public_host="$(curl -fL --connect-timeout 5 --max-time 10 "$endpoint" 2>/dev/null | tr -d '[:space:]' || true)"
+    public_host="$(fetch_text "$WORK_DIR/public-ip" "$endpoint" 2>/dev/null | tr -d '[:space:]' || true)"
     [ -n "$public_host" ] && break
   done
   printf "%s" "$public_host"
@@ -215,7 +237,15 @@ trap cleanup EXIT
 
 install_deps() {
   echo "[1/6] 安装依赖..."
-  apk add --no-cache ca-certificates curl unzip openssl jq
+  command -v apk >/dev/null 2>&1 || die "这不是 Alpine Linux，找不到 apk。"
+  mkdir -p "$XRAY_DIR"
+  apk add --no-cache ca-certificates unzip openssl jq
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "未找到 curl 或 wget，安装 BusyBox wget..."
+    apk add --no-cache wget
+  fi
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 ||
+    die "下载工具不可用，请先检查 Alpine 软件源。"
   update-ca-certificates
   PUBLIC_HOST="$(detect_public_host)"
   if [ -n "$PUBLIC_HOST" ]; then
@@ -238,9 +268,7 @@ arch_name() {
 resolve_latest_version() {
   local latest_url
   echo "查询 GitHub 官方最新正式发布..."
-  if curl -fL --connect-timeout 10 --max-time 30 \
-    -H 'Accept: application/vnd.github+json' \
-    -o "$WORK_DIR/release.json" \
+  if fetch_to "$WORK_DIR/release.json" \
     "https://api.github.com/repos/XTLS/Xray-core/releases/latest"; then
     XRAY_VERSION="$(jq -er \
       'select(.draft == false and .prerelease == false) | .tag_name | select(type == "string" and length > 0)' \
@@ -248,9 +276,10 @@ resolve_latest_version() {
   fi
   if [ -z "$XRAY_VERSION" ]; then
     echo "官方 API 未返回版本，尝试最新发布页面..."
-    if latest_url="$(curl -fIL --connect-timeout 10 --max-time 30 \
-      -o /dev/null -w '%{url_effective}' \
-      "https://github.com/XTLS/Xray-core/releases/latest")"; then
+    if command -v curl >/dev/null 2>&1 &&
+       latest_url="$(curl -fIL --connect-timeout 10 --max-time 30 \
+         -o /dev/null -w '%{url_effective}' \
+         "https://github.com/XTLS/Xray-core/releases/latest")"; then
       case "$latest_url" in
         https://github.com/XTLS/Xray-core/releases/tag/*)
           XRAY_VERSION="${latest_url##*/}"
@@ -279,14 +308,12 @@ download_xray() {
   github_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${machine}.zip"
   mirror_url="https://sourceforge.net/projects/xray-core.mirror/files/${XRAY_VERSION}/Xray-linux-${machine}.zip/download"
   echo "目标版本: ${XRAY_VERSION}"
-  if curl -fL --connect-timeout 10 --max-time 180 --retry 1 \
-    -o "$WORK_DIR/xray.zip" "$github_url"; then
+  if fetch_to "$WORK_DIR/xray.zip" "$github_url"; then
     echo "Xray 下载成功: GitHub"
   else
     echo "GitHub 下载失败，尝试 SourceForge 的同一版本 ${XRAY_VERSION}..."
     rm -f "$WORK_DIR/xray.zip"
-    curl -fL --connect-timeout 10 --max-time 180 --retry 1 \
-      -o "$WORK_DIR/xray.zip" "$mirror_url" ||
+    fetch_to "$WORK_DIR/xray.zip" "$mirror_url" ||
       die "无法下载 ${XRAY_VERSION}，镜像可能尚未同步；已停止，不自动降级。"
   fi
   unzip -oq "$WORK_DIR/xray.zip" xray -d "$WORK_DIR"
