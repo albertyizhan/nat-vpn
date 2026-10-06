@@ -14,6 +14,47 @@ TX=""
 LOCK=""
 
 die() { printf '错误: %s\n' "$*" >&2; exit 1; }
+trusted_path() {
+  local path="$1" kind="${2:-any}" part owner mode child=0
+  case "$path" in
+    /*) ;;
+    *) die "路径必须为绝对路径: $path" ;;
+  esac
+  if [ -e "$path" ]; then
+    case "$kind" in
+      file) [ -f "$path" ] || die "需要普通文件路径: $path" ;;
+      dir) [ -d "$path" ] || die "需要目录路径: $path" ;;
+    esac
+  fi
+  case "$path" in
+    *[!A-Za-z0-9_./-]*|*//*|*/../*|*/./*|*/..|*/.|*/)
+      die "路径仅允许字母、数字、下划线、点、连字符和单个斜杠: $path" ;;
+  esac
+  part="$path"
+  while :; do
+    [ ! -L "$part" ] || die "不能使用符号链接路径: $part"
+    if [ -e "$part" ]; then
+      [ -d "$part" ] || [ -f "$part" ] || die "路径不是普通文件或目录: $part"
+      owner="$(stat -c %u "$part")"
+      mode="$(stat -c %a "$part")"
+      [ "$owner" = 0 ] || die "路径必须属于 root: $part"
+      if [ "$((0$mode & 022))" -ne 0 ]; then
+        # Permit a protected root-owned child beneath a sticky temporary directory.
+        [ "$child" = 1 ] && [ -d "$part" ] && [ "$((0$mode & 01000))" -ne 0 ] ||
+          die "路径不能允许组或其他用户写入: $part"
+      fi
+      if [ -f "$part" ]; then
+        [ "$(stat -c %h "$part")" = 1 ] || die "不能写入硬链接文件: $part"
+      fi
+      child=1
+    else
+      child=0
+    fi
+    [ "$part" != / ] || break
+    part="${part%/*}"
+    [ -n "$part" ] || part=/
+  done
+}
 ask() { printf '%s: ' "$1" >&2; IFS= read -r answer || exit 1; printf '%s' "$answer"; }
 confirm() { case "$(ask "$1 [y/N]")" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
 valid_name() { printf '%s\n' "$1" | grep -Eq '^[A-Za-z][A-Za-z0-9]*$'; }
@@ -39,6 +80,8 @@ cleanup() {
     rm -f "$TX/access.txt"
     rm -f "$TX/next.json"
     rm -f "$TX/connections.txt"
+    rm -f "$TX/selected-node"
+    rm -f "$TX/runner.sh"
     rmdir "$TX" 2>/dev/null || true
   fi
   [ -z "$LOCK" ] || rmdir "$LOCK" 2>/dev/null || true
@@ -49,6 +92,24 @@ trap 'exit 143' TERM
 
 need_tools() {
   [ "$(id -u)" -eq 0 ] || die "请使用 root 运行。"
+  case "$SERVICE" in
+    ''|[!A-Za-z]*|*[!A-Za-z0-9_-]*)
+      die "服务名称只能以字母开头，包含字母、数字、下划线或连字符。" ;;
+  esac
+  for path in "$XRAY_DIR" "$LOG_DIR"; do
+    trusted_path "$path" dir
+  done
+  for path in "$XRAY_BIN" "$CONFIG" "$STATE" "$RUNNER" "$LOG_DIR/access.log"; do
+    trusted_path "$path" file
+  done
+  if [ -n "${MENU_RESULT:-}" ]; then
+    case "$MENU_RESULT" in
+      "$XRAY_DIR"/.menu-result.*) ;;
+      *) die "菜单返回文件必须为当前配置目录中的临时文件。" ;;
+    esac
+    trusted_path "$MENU_RESULT" file
+    [ -f "$MENU_RESULT" ] || die "菜单返回文件不存在。"
+  fi
   command -v jq >/dev/null 2>&1 || die "缺少 jq，请执行 apk add --no-cache jq。"
   [ -x "$XRAY_BIN" ] || die "找不到 Xray: $XRAY_BIN"
   [ -r "$CONFIG" ] || die "找不到配置: $CONFIG"
@@ -107,6 +168,7 @@ api_address() {
 
 sample_stats() {
   local addr epoch pid
+  prepare_quota_cycles
   addr="$(api_address)" || return 0
   [ -n "$addr" ] || return 0
   "$XRAY_BIN" api statsquery --server="$addr" -pattern 'inbound>>>' > "$TX/stats.json" 2>/dev/null ||
@@ -156,6 +218,7 @@ sample_logs() {
   bytes="$(wc -c < "$TX/connections.txt" | tr -d ' ')"
   for tag in $(jq -r '.nodes | to_entries[] | select(.value.logging==true) | .key' "$TX/state.json"); do
     valid_name "$tag" || continue
+    trusted_path "$LOG_DIR/$tag-connections.log" file
     touch "$LOG_DIR/$tag-connections.log"
     chmod 600 "$LOG_DIR/$tag-connections.log"
     awk -v tag="$tag" '
@@ -205,11 +268,12 @@ persist_node() {
 install_sampler() {
   command -v crontab >/dev/null 2>&1 || die "缺少 crontab，请安装 BusyBox。"
   command -v crond >/dev/null 2>&1 || die "缺少 crond，请安装 BusyBox。"
-  case "$XRAY_DIR$CONFIG$STATE$XRAY_BIN$LOG_DIR$SERVICE" in
-    *"'"*|*'%'*|*'
-'*) die "定时任务路径不能包含单引号、百分号或换行。" ;;
-  esac
-  [ "$SELF" = "$RUNNER" ] || cp "$SELF" "$RUNNER"
+  trusted_path "$RUNNER" file
+  if [ "$SELF" != "$RUNNER" ]; then
+    cp "$SELF" "$TX/runner.sh"
+    chmod 700 "$TX/runner.sh"
+    mv "$TX/runner.sh" "$RUNNER"
+  fi
   chmod 700 "$RUNNER"
   state_edit '.sampler=true'
   {
@@ -221,7 +285,7 @@ install_sampler() {
   rc-service crond status >/dev/null 2>&1 || rc-service crond start
 }
 
-enable_statistics() {
+configure_statistics() {
   local tag api_tag
   tag="$1"
   api_tag="$(jq -r '.api.tag // "NodeStatsAPI"' "$TX/config.json")"
@@ -245,6 +309,10 @@ enable_statistics() {
   ' --arg tag "$api_tag"
   state_edit '.nodes[$tag].statistics=true' --arg tag "$tag"
   install_sampler
+}
+
+enable_statistics() {
+  configure_statistics "$1"
   apply
   echo "节点字节统计已开启；每分钟保存一次上下行累计值。"
 }
@@ -256,7 +324,7 @@ enable_logging() {
   echo "Xray 原始访问日志是全局的；采样任务按精确入站标签分流为节点日志。"
   confirm "开启 $tag 的日志？" || return 0
   existing="$(jq -r '.log.access // ""' "$TX/config.json")"
-  case "$existing" in ""|none|"$LOG_DIR/access.log") ;; *) die "已有自定义访问日志 $existing，未自动覆盖。";; esac
+  case "$existing" in ""|none|"$LOG_DIR/access.log") ;; *) die "已有自定义访问日志 ${existing}，未自动覆盖。";; esac
   mkdir -p "$LOG_DIR"
   chmod 700 "$LOG_DIR"
   touch "$LOG_DIR/access.log"; chmod 600 "$LOG_DIR/access.log"
@@ -275,11 +343,17 @@ show_stats() {
     "统计开关: \(.statistics // false)",
     "累计上行: \(.upload_bytes // 0) 字节",
     "累计下行: \(.download_bytes // 0) 字节",
+    "本周期使用: \([0, ((.upload_bytes // 0)+(.download_bytes // 0)-(.quota_base_bytes // 0))] | max) 字节",
+    "月流量上限: \(.quota_gib // 0) GiB (0=不限，上下行合计)",
+    "重置日: 每月 \(.reset_day // 1) 日 UTC 00:00（短月份取月末）",
+    "当前周期: \(.quota_cycle // "未开通")",
+    "停用原因: \(.disabled_reason // "无")",
     "最近采样: \(.sampled_at // "尚未采样")",
     "连接上限: \(.max_connections // 0) (0=无限制)",
     "节点日志: \(.logging // false)"
   ' "$TX/state.json"
   if [ -r "$LOG_DIR/$tag-connections.log" ]; then
+    trusted_path "$LOG_DIR/$tag-connections.log" file
     echo "最近 30 条目标连接记录:"
     tail -n 30 "$LOG_DIR/$tag-connections.log"
   fi
@@ -321,14 +395,111 @@ set_max_connections() {
   echo "连接上限已保存。"
 }
 
+quota_period() {
+  # Use Gregorian calendar arithmetic instead of GNU date extensions (BusyBox compatible).
+  jq -nr --arg today "$(date -u +%Y-%m-%d)" --argjson day "$1" '
+    def monthdays($y;$m):
+      if $m==2 then
+        if ($y%400==0 or ($y%4==0 and $y%100!=0)) then 29 else 28 end
+      elif ([4,6,9,11] | index($m))!=null then 30 else 31 end;
+    def pad: tostring | if length<2 then "0"+. else . end;
+    ($today | split("-") | map(tonumber)) as $d |
+    (if $d[2] >= ([$day,monthdays($d[0];$d[1])] | min) then $d[0:2]
+     elif $d[1]==1 then [$d[0]-1,12] else [$d[0],$d[1]-1] end) as $p |
+    ($p[0]|tostring)+"-"+($p[1]|pad)+"-"+([$day,monthdays($p[0];$p[1])] | min | pad)
+  '
+}
+
+prepare_quota_cycles() {
+  local tag period
+  for tag in $(jq -r '.nodes | to_entries[] | select((.value.quota_gib // 0)>0) | .key' "$TX/state.json"); do
+    period="$(quota_period "$(state_value "$tag" '.reset_day // 1')")"
+    # A backwards clock jump must not give the node a second allowance.
+    state_edit '
+      .nodes[$tag] |= (
+        if .quota_cycle==null or $period>.quota_cycle then
+          .quota_cycle=$period |
+          .quota_base_bytes=((.upload_bytes // 0)+(.download_bytes // 0)) |
+          if .disabled_reason=="monthly_quota" then .quota_reset_pending=true else . end
+        else . end)
+    ' --arg tag "$tag" --arg period "$period"
+  done
+}
+
+quota_exhausted() {
+  jq -e --arg tag "$1" '.nodes[$tag] |
+    (.quota_gib // 0)>0 and
+    ((.upload_bytes // 0)+(.download_bytes // 0)-(.quota_base_bytes // 0)) >= (.quota_gib*1073741824)
+  ' "$TX/state.json" >/dev/null
+}
+
+set_monthly_quota() {
+  local tag quota day period previous_day
+  tag="$1"
+  quota="$(ask "月流量上限 GiB，0=不限；当前 $(state_value "$tag" '.quota_gib // 0')")"
+  valid_number "$quota" || die "请输入非负整数 GiB（不要加前导零）。"
+  if [ "$quota" -eq 0 ]; then
+    state_edit '.nodes[$tag].quota_gib=0 |
+      if .nodes[$tag].disabled_reason=="monthly_quota" then
+        .nodes[$tag].quota_reset_pending=true else . end' --arg tag "$tag"
+    check_limits
+    echo "月流量限制已取消。"
+    return
+  fi
+  day="$(ask "每月重置日 1–31，UTC 00:00；短月份取月末；当前 $(state_value "$tag" '.reset_day // 1')")"
+  valid_number "$day" && [ "$day" -ge 1 ] && [ "$day" -le 31 ] || die "重置日必须为 1–31。"
+  period="$(quota_period "$day")"
+  previous_day="$(state_value "$tag" '.reset_day // 1')"
+  echo "上行+下行合计，每分钟检查一次；超额停用，新周期自动恢复因流量超额停用的节点。"
+  echo "首次开通从现在开始计费；已有配额改上限/重置日保留本周期用量，不清零累计统计。"
+  confirm "保存月流量限制？" || return 0
+  state_edit '
+    .nodes[$tag] |= (
+      if .quota_cycle==null then
+        .quota_base_bytes=((.upload_bytes // 0)+(.download_bytes // 0)) | .quota_cycle=$period
+      elif $day!=$previous_day then .quota_cycle=$period else . end |
+      .quota_gib=$quota | .reset_day=$day |
+      if .disabled_reason=="monthly_quota" then .quota_reset_pending=true else . end)
+  ' --arg tag "$tag" --argjson quota "$quota" --argjson day "$day" \
+    --argjson previous_day "$previous_day" --arg period "$period"
+  if [ "$(state_value "$tag" '.statistics // false')" != true ]; then
+    configure_statistics "$tag"
+    apply
+  else
+    install_sampler
+  fi
+  check_limits
+  echo "月流量策略已保存。"
+}
+
 check_limits() {
   local changed tag port count max
-  command -v ss >/dev/null 2>&1 || return 0
   changed=0
+  for tag in $(jq -r '.nodes | to_entries[] |
+    select(.value.quota_reset_pending==true or
+      (.value.disabled!=true and (.value.quota_gib // 0)>0)) | .key' "$TX/state.json"); do
+    if [ "$(state_value "$tag" '.quota_reset_pending // false')" = true ]; then
+      state_edit 'del(.nodes[$tag].quota_reset_pending)' --arg tag "$tag"
+      if [ "$(state_value "$tag" '.disabled_reason // ""')" = monthly_quota ] &&
+         ! quota_exhausted "$tag"; then
+        state_edit '.nodes[$tag].disabled=false | .nodes[$tag].disabled_reason=null' --arg tag "$tag"
+        persist_node "$tag"
+        changed=1
+        echo "节点 $tag 的流量配额已恢复，自动启用。" >&2
+      fi
+    fi
+    if [ "$(state_value "$tag" '.disabled // false')" != true ] && quota_exhausted "$tag"; then
+      state_edit '.nodes[$tag].disabled=true | .nodes[$tag].disabled_reason="monthly_quota"' --arg tag "$tag"
+      persist_node "$tag"
+      changed=1
+      echo "节点 $tag 已达到月流量上限，停用。" >&2
+    fi
+  done
   for tag in $(jq -r '.nodes | to_entries[] |
     select(.value.disabled!=true and (.value.max_connections // 0)>0) | .key' "$TX/state.json"); do
     port="$(node_value "$tag" '.port')"
     valid_port "$port" || continue
+    command -v ss >/dev/null 2>&1 || { echo "缺少 ss，未执行 $tag 的连接限制。" >&2; continue; }
     ss -Hnt state established "sport = :$port" > "$TX/connections.txt" ||
       { echo "无法读取 $tag 的连接数，未判为零。" >&2; continue; }
     count="$(wc -l < "$TX/connections.txt" | tr -d ' ')"
@@ -410,6 +581,9 @@ show_link() {
 set_enabled() {
   local tag disabled
   tag="$1"; disabled="$2"
+  if [ "$disabled" = false ] && quota_exhausted "$tag"; then
+    die "本周期配额已用尽，请提高/取消月流量限制，或等待下次重置。"
+  fi
   state_edit '.nodes[$tag].disabled=$disabled | .nodes[$tag].disabled_reason=
     (if $disabled then "manual" else null end)' --arg tag "$tag" --argjson disabled "$disabled"
   persist_node "$tag"
@@ -422,6 +596,8 @@ rename_node() {
   tag="$1"; new="$(ask "新名称（英文字母开头，后续仅字母和数字）")"
   valid_name "$new" || die "名称无效。"
   [ "$new" != "$tag" ] || return 0
+  trusted_path "$LOG_DIR/$tag-connections.log" file
+  trusted_path "$LOG_DIR/$new-connections.log" file
   [ ! -e "$LOG_DIR/$new-connections.log" ] || die "新名称日志已存在，请先处理: $LOG_DIR/$new-connections.log"
   jq -e --arg new "$new" '
     .nodes[$new]!=null or any(.nodes[]; .inbound.tag==($new+"Out"))
@@ -446,7 +622,8 @@ rename_node() {
   if [ -e "$LOG_DIR/$tag-connections.log" ]; then
     mv "$LOG_DIR/$tag-connections.log" "$LOG_DIR/$new-connections.log"
   fi
-  echo "已改名为 $new，请重新显示导入链接。"
+  echo "已改名为 ${new}，请重新显示导入链接。"
+  printf '%s\n' "$new" > "$TX/selected-node"
 }
 
 delete_node() {
@@ -582,12 +759,23 @@ run_action() {
       else save_only; fi
       echo "已停止此节点日志分流；其他节点开启日志时，全局原始日志仍包含此节点连接。" ;;
     max) set_max_connections "$tag" ;;
+    quota) set_monthly_quota "$tag" ;;
     edit) edit_config "$tag" ;;
     rename) rename_node "$tag" ;;
     enable) set_enabled "$tag" false ;;
     disable) set_enabled "$tag" true ;;
     delete) delete_node "$tag" ;;
   esac
+  # Send the committed identity back to the interactive parent (no persistent alias).
+  if [ -n "${MENU_RESULT:-}" ]; then
+    if [ -r "$TX/selected-node" ]; then
+      cp "$TX/selected-node" "$MENU_RESULT"
+    elif [ -n "$(node "$tag")" ]; then
+      printf '%s\n' "$tag" > "$MENU_RESULT"
+    else
+      printf '\n' > "$MENU_RESULT"
+    fi
+  fi
 }
 
 list_nodes() {
@@ -602,13 +790,56 @@ list_nodes() {
   '
 }
 
+node_exists() {
+  jq -e --arg tag "$1" 'any(.inbounds[]; .tag==$tag)' "$CONFIG" >/dev/null && return 0
+  [ -r "$STATE" ] && jq -e --arg tag "$1" '.nodes[$tag].inbound!=null' "$STATE" >/dev/null
+}
+
+node_menu() {
+  local tag action result choice
+  tag="$1"
+  while node_exists "$tag"; do
+    echo
+    echo "节点: $tag"
+    echo "1. 显示导入链接"
+    echo "2. 查看流量统计与连接日志"
+    echo "3. 开通节点流量统计"
+    echo "4. 开启节点连接日志"
+    echo "5. 关闭节点连接日志"
+    echo "6. 设置最大连接数（0=无限制）"
+    echo "7. 修改节点配置"
+    echo "8. 改名"
+    echo "9. 停用"
+    echo "10. 启用"
+    echo "11. 删除"
+    echo "12. 月流量上限 / 重置日"
+    echo "0. 返回完整列表，重新选择节点"
+    choice="$(ask "选择节点操作")"
+    case "$choice" in
+      1) action=link ;; 2) action=stats ;; 3) action=enable_stats ;;
+      4) action=enable_logs ;; 5) action=disable_logs ;; 6) action=max ;;
+      7) action=edit ;; 8) action=rename ;; 9) action=disable ;;
+      10) action=enable ;; 11) action=delete ;; 12) action=quota ;;
+      0) return ;;
+      *) echo "无效选项。"; continue ;;
+    esac
+    result="$(mktemp "$XRAY_DIR/.menu-result.XXXXXX")"
+    if MENU_RESULT="$result" sh "$SELF" --action "$action" "$tag"; then
+      [ ! -s "$result" ] || tag="$(cat "$result")"
+    else
+      echo "操作未完成，请查看上面的提示。"
+    fi
+    rm -f "$result"
+  done
+}
+
 main() {
   need_tools
   if [ "${1:-}" = --action ]; then
     [ "$#" -eq 3 ] || die "操作参数不完整。"
     valid_name "$3" || die "节点名称无效。"
     case "$2" in
-      link|stats|enable_stats|enable_logs|disable_logs|max|edit|rename|enable|disable|delete)
+      link|stats|enable_stats|enable_logs|disable_logs|max|quota|edit|rename|enable|disable|delete)
         run_action "$2" "$3" ;;
       *) die "未知操作。" ;;
     esac
@@ -632,27 +863,8 @@ main() {
       1)
         tag="$(ask "节点名称")"
         valid_name "$tag" || { echo "名称必须以字母开头，后续仅字母和数字。"; continue; }
-        echo "节点: $tag"
-        echo "1. 显示导入链接"
-        echo "2. 查看流量统计与连接日志"
-        echo "3. 开通节点流量统计"
-        echo "4. 开启节点连接日志"
-        echo "5. 关闭节点连接日志"
-        echo "6. 设置最大连接数（0=无限制）"
-        echo "7. 修改节点配置"
-        echo "8. 改名"
-        echo "9. 停用"
-        echo "10. 启用"
-        echo "11. 删除"
-        echo "0. 返回"
-        case "$(ask "选择节点操作")" in
-          1) action=link ;; 2) action=stats ;; 3) action=enable_stats ;;
-          4) action=enable_logs ;; 5) action=disable_logs ;; 6) action=max ;;
-          7) action=edit ;; 8) action=rename ;; 9) action=disable ;;
-          10) action=enable ;; 11) action=delete ;; 0) continue ;;
-          *) echo "无效选项。"; continue ;;
-        esac
-        sh "$SELF" --action "$action" "$tag" || echo "操作未完成，请查看上面的提示。"
+        node_exists "$tag" || { echo "节点不存在。"; continue; }
+        node_menu "$tag"
         ;;
       *) echo "无效选项。" ;;
     esac
