@@ -16,10 +16,15 @@
 在目标 Alpine 机器上以 `root` 执行：
 
 ```sh
-apk add --no-cache curl ca-certificates
-curl -fL --connect-timeout 10 --max-time 120 \
-  -o /root/xray-installer.sh \
-  https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-installer.sh
+apk add --no-cache ca-certificates
+if command -v curl >/dev/null 2>&1; then
+  curl -fL --connect-timeout 10 --max-time 120 \
+    -o /root/xray-installer.sh \
+    https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-installer.sh
+else
+  wget -q -O /root/xray-installer.sh \
+    https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-installer.sh
+fi
 chmod +x /root/xray-installer.sh
 /root/xray-installer.sh
 ```
@@ -28,7 +33,7 @@ chmod +x /root/xray-installer.sh
 
 - 动态获取 Xray 最新正式版本
 - 优先从 GitHub 下载，失败后尝试同版本 SourceForge 镜像
-- 安装 `curl`、`unzip`、`openssl`、`jq` 等依赖
+- 安装 `unzip`、`openssl`、`jq` 等依赖；没有 `curl` 时使用 BusyBox `wget`
 - 支持 VLESS + Reality、Hysteria2、Shadowsocks
 - 支持直连、中转、落地模式
 - 支持 NAT / 非 NAT，并分别记录内部监听端口和外部映射端口
@@ -36,7 +41,6 @@ chmod +x /root/xray-installer.sh
 - 创建节点时要求填写名称：必须以英文字母开头，后续只能使用英文字母和数字
 - 允许同一台 NAT 机器创建多个相同协议节点，但每个节点必须使用不同名称和内部端口
 - VLESS + Reality 默认 SNI 为 `www.bing.com`，可通过 `SERVER_NAME` 自定义；脚本拒绝使用 Cloudflare 域名
-- 创建 VLESS 节点时可扫描 Bing、Apple、Amazon、Yahoo、Samsung、NVIDIA 候选域名，或手动输入 SNI；选定域名同时作为 Reality 目标（443）
 - 创建 VLESS 节点时可扫描 Bing、Amazon、Yahoo、Samsung、NVIDIA 候选域名，或手动输入 SNI；选定域名同时作为 Reality 目标（443），Apple 不在自动候选列表中
 - 扫描在当前服务器上检查 TLS 1.3、X25519、H2、证书验证及证书消息大小，按本轮 TLS 建连时间推荐；不是客户端到节点的延迟测试，也不保证后续一直可用
 - 注册 OpenRC 开机自启
@@ -57,14 +61,19 @@ NAT 模式必须填写内部端口和外部映射端口。脚本不会自动创�
 安装器完成后，在同一台机器运行管理器：
 
 ```sh
-curl -fL --connect-timeout 10 --max-time 120 \
-  -o /root/xray-manager.sh \
-  https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-manager.sh
+if command -v curl >/dev/null 2>&1; then
+  curl -fL --connect-timeout 10 --max-time 120 \
+    -o /root/xray-manager.sh \
+    https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-manager.sh
+else
+  wget -q -O /root/xray-manager.sh \
+    https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-manager.sh
+fi
 chmod +x /root/xray-manager.sh
 /root/xray-manager.sh
 ```
 
-管理器会读取 `/usr/local/etc/xray/config.json`，自动检测已有入站和用户，不会直接覆盖原配置。修改配置前会生成带时间戳的备份。安装器生成的节点名称会显示为入站标签和导入链接名称。
+管理器会读取 `/etc/xray/config.json`，自动检测已有入站和用户，不会直接覆盖原配置。修改配置前会生成带时间戳的备份。安装器生成的节点名称会显示为入站标签和导入链接名称。
 
 ## 管理器功能
 
@@ -91,7 +100,7 @@ Hysteria2 使用受信任证书，不使用 `insecure=1`。使用 Hysteria2 时�
 ```sh
 rc-service xray status
 rc-service xray restart
-/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
+/usr/local/bin/xray run -test -config /etc/xray/config.json
 ```
 
 默认服务输出丢弃到 `/dev/null`，不创建额外持久化日志。
