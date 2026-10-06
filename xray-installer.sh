@@ -131,7 +131,7 @@ choose_reality_sni() {
     1)
       : > "$WORK_DIR/sni-results.tsv"
       # These are candidates, not a permanent compatibility allowlist.
-      for host in www.bing.com www.apple.com www.amazon.com www.yahoo.com www.samsung.com www.nvidia.com; do
+      for host in www.bing.com www.amazon.com www.yahoo.com www.samsung.com www.nvidia.com; do
         probe_sni "$host" >> "$WORK_DIR/sni-results.tsv" || true
       done
       sort -n "$WORK_DIR/sni-results.tsv" > "$WORK_DIR/sni-ranked.tsv"
