@@ -35,7 +35,9 @@ chmod +x /root/xray-installer.sh
 - 自动生成 UUID、密码、Reality 密钥、Short ID 和导入链接
 - 创建节点时要求填写名称：必须以英文字母开头，后续只能使用英文字母和数字
 - 允许同一台 NAT 机器创建多个相同协议节点，但每个节点必须使用不同名称和内部端口
-- VLESS + Reality 默认 SNI 为 `www.microsoft.com`，脚本拒绝使用 Cloudflare 域名
+- VLESS + Reality 默认 SNI 为 `www.bing.com`，可通过 `SERVER_NAME` 自定义；脚本拒绝使用 Cloudflare 域名
+- 创建 VLESS 节点时可扫描 Bing、Apple、Amazon、Yahoo、Samsung、NVIDIA 候选域名，或手动输入 SNI；选定域名同时作为 Reality 目标（443）
+- 扫描在当前服务器上检查 TLS 1.3、X25519、H2、证书验证及证书消息大小，按本轮 TLS 建连时间推荐；不是客户端到节点的延迟测试，也不保证后续一直可用
 - 注册 OpenRC 开机自启
 - Hysteria2 安装后创建每日证书续期任务，续期成功自动重载 Xray
 
