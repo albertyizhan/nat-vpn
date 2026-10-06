@@ -12,6 +12,8 @@ SERVICE_NAME="xray"
 WORK_DIR=""
 GENERATED_CONFIG=""
 CANDIDATE_CONFIG=""
+CANDIDATE_STATE=""
+PREVIOUS_CONFIG=""
 CREATION_LOCK=""
 XRAY_VERSION="${XRAY_VERSION:-}"
 PUBLIC_PORT="${PUBLIC_PORT:-}"
@@ -225,12 +227,15 @@ cleanup() {
     rm -f "$WORK_DIR/xray.zip"
     rm -f "$WORK_DIR/xray"
     rm -f "$WORK_DIR/node.json"
+    rm -f "$WORK_DIR/node-state.json"
     rm -f "$WORK_DIR/sni-probe.txt"
     rm -f "$WORK_DIR/sni-results.tsv"
     rm -f "$WORK_DIR/sni-ranked.tsv"
     rmdir "$WORK_DIR" 2>/dev/null || true
   fi
   [ -z "$CANDIDATE_CONFIG" ] || rm -f "$CANDIDATE_CONFIG"
+  [ -z "$CANDIDATE_STATE" ] || rm -f "$CANDIDATE_STATE"
+  [ -z "$PREVIOUS_CONFIG" ] || rm -f "$PREVIOUS_CONFIG"
   [ -z "$CREATION_LOCK" ] || rmdir "$CREATION_LOCK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -519,9 +524,9 @@ make_landing_config() {
   "outbounds": [{"protocol": "freedom"}]
 }
 EOF
-  client_host="$(ask_endpoint '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
+  CLIENT_HOST="$(ask_endpoint '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
   userinfo="$(printf '%s' "${method}:${password}" | openssl base64 -A)"
-  LINK="ss://${userinfo}@${client_host}:${PUBLIC_PORT}#${NODE_NAME}"
+  LINK="ss://${userinfo}@${CLIENT_HOST}:${PUBLIC_PORT}#${NODE_NAME}"
   echo "落地协议: Shadowsocks ${method}"
   echo "SS 密码: ${password}"
 }
@@ -537,6 +542,12 @@ check_existing_config() {
 }
 
 name_available() {
+  if [ -e "$XRAY_DIR/manager-state.json" ]; then
+    jq -e --arg name "$1" '
+      .nodes[$name] == null and .nodes[$name+"Out"] == null and
+      ([.nodes[]?.inbound.tag] | any(. == $name or . == ($name+"Out")) | not)
+    ' "$XRAY_DIR/manager-state.json" >/dev/null || return 1
+  fi
   [ -e "$XRAY_DIR/config.json" ] || return 0
   jq -e --arg name "$1" '
     ([.inbounds[]?.tag, .outbounds[]?.tag] |
@@ -545,6 +556,11 @@ name_available() {
 }
 
 port_available() {
+  if [ -e "$XRAY_DIR/manager-state.json" ]; then
+    jq -e --argjson port "$1" '
+      [.nodes[]?.inbound.port | . != $port] | all
+    ' "$XRAY_DIR/manager-state.json" >/dev/null || return 1
+  fi
   [ -e "$XRAY_DIR/config.json" ] || return 0
   # Conservatively reserve an internal port across all transports/listeners.
   jq -e --argjson port "$1" '
@@ -588,17 +604,37 @@ stage_node_config() {
   fi
 }
 
+stage_node_state() {
+  CANDIDATE_STATE="$(mktemp "$XRAY_DIR/.state-candidate.XXXXXX")"
+  if [ -e "$XRAY_DIR/manager-state.json" ]; then
+    cp "$XRAY_DIR/manager-state.json" "$CANDIDATE_STATE"
+  else
+    printf '{"nodes":{}}\n' > "$CANDIDATE_STATE"
+  fi
+  jq --arg name "$NODE_NAME" --arg host "$CLIENT_HOST" --argjson port "$PUBLIC_PORT" \
+    --arg sni "${cert_cn:-}" --slurpfile node "$GENERATED_CONFIG" '
+    .nodes = (.nodes // {}) |
+    .nodes[$name] = {inbound:$node[0].inbounds[0], disabled:false,
+      public_host:$host, public_port:$port, sni:$sni, max_connections:0}
+  ' "$CANDIDATE_STATE" > "$WORK_DIR/node-state.json"
+  mv "$WORK_DIR/node-state.json" "$CANDIDATE_STATE"
+}
+
 main() {
   need_root
   validate_reality_server_name
   umask 077
   mkdir -p "$XRAY_DIR"
-  mkdir "$XRAY_DIR/.creation-lock" 2>/dev/null ||
-    die "另一个创建任务正在运行，或上次异常退出留下了 $XRAY_DIR/.creation-lock；确认无人运行后手动处理。"
-  CREATION_LOCK="$XRAY_DIR/.creation-lock"
+  mkdir "$XRAY_DIR/.manager.lock" 2>/dev/null ||
+    die "另一个安装/管理任务正在运行，或上次异常退出留下了 $XRAY_DIR/.manager.lock；确认无人运行后手动处理。"
+  CREATION_LOCK="$XRAY_DIR/.manager.lock"
   WORK_DIR="$(mktemp -d /tmp/xray-installer.XXXXXX)"
   GENERATED_CONFIG="$WORK_DIR/node.json"
   install_deps
+  if [ -e "$XRAY_DIR/manager-state.json" ]; then
+    jq -e 'type=="object" and ((.nodes // {}) | type=="object")' "$XRAY_DIR/manager-state.json" >/dev/null ||
+      die "管理器状态文件损坏，未覆盖。请检查 $XRAY_DIR/manager-state.json"
+  fi
   check_existing_config
   if [ -x "$XRAY_BIN" ]; then
     echo "[2/6] 复用已安装的 Xray，不自动替换正在使用的程序。"
@@ -669,11 +705,10 @@ main() {
   echo "[4/6] 检查配置..."
   stage_node_config
   "$XRAY_BIN" run -test -format json -config "$CANDIDATE_CONFIG"
-  backup_path=""
+  stage_node_state
   if [ -e "$XRAY_DIR/config.json" ]; then
-    backup_path="$(mktemp "$XRAY_DIR/config.json.bak.XXXXXX")"
-    cp "$XRAY_DIR/config.json" "$backup_path"
-    echo "原配置已备份: $backup_path"
+    PREVIOUS_CONFIG="$(mktemp "$XRAY_DIR/.previous-config.XXXXXX")"
+    cp "$XRAY_DIR/config.json" "$PREVIOUS_CONFIG"
   fi
   mv "$CANDIDATE_CONFIG" "$XRAY_DIR/config.json"
   CANDIDATE_CONFIG=""
@@ -684,13 +719,15 @@ main() {
   fi
   if ! rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 &&
      ! rc-service "$SERVICE_NAME" start; then
-    if [ -n "$backup_path" ]; then
-      cp "$backup_path" "$XRAY_DIR/config.json"
+    if [ -n "$PREVIOUS_CONFIG" ]; then
+      cp "$PREVIOUS_CONFIG" "$XRAY_DIR/config.json"
       rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || true
-      die "启动失败，已恢复原配置；备份保留在 $backup_path"
+      die "启动失败，已恢复本次操作前的配置。"
     fi
     die "启动失败，请检查端口占用和服务配置。"
   fi
+  mv "$CANDIDATE_STATE" "$XRAY_DIR/manager-state.json"
+  CANDIDATE_STATE=""
   echo "[6/6] 完成"
   echo
   echo "节点名称: ${NODE_NAME}"
