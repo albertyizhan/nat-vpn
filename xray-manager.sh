@@ -806,20 +806,20 @@ node_menu() {
     echo "3. 开通节点流量统计"
     echo "4. 开启节点连接日志"
     echo "5. 关闭节点连接日志"
-    echo "6. 设置最大连接数（0=无限制）"
-    echo "7. 修改节点配置"
-    echo "8. 改名"
-    echo "9. 停用"
-    echo "10. 启用"
-    echo "11. 删除"
-    echo "12. 月流量上限 / 重置日"
+    echo "6. 月流量上限 / 重置日"
+    echo "7. 设置最大连接数（0=无限制）"
+    echo "8. 修改节点配置"
+    echo "9. 改名"
+    echo "10. 启用节点"
+    echo "11. 停用节点"
+    echo "12. 删除节点"
     echo "0. 返回完整列表，重新选择节点"
     choice="$(ask "选择节点操作")"
     case "$choice" in
       1) action=link ;; 2) action=stats ;; 3) action=enable_stats ;;
-      4) action=enable_logs ;; 5) action=disable_logs ;; 6) action=max ;;
-      7) action=edit ;; 8) action=rename ;; 9) action=disable ;;
-      10) action=enable ;; 11) action=delete ;; 12) action=quota ;;
+      4) action=enable_logs ;; 5) action=disable_logs ;; 6) action=quota ;;
+      7) action=max ;; 8) action=edit ;; 9) action=rename ;;
+      10) action=enable ;; 11) action=disable ;; 12) action=delete ;;
       0) return ;;
       *) echo "无效选项。"; continue ;;
     esac
