@@ -1,19 +1,13 @@
-# Alpine Xray 安装器与管理器
+# Alpine Xray 安装器与节点管理器
 
-面向 Alpine Linux / OpenRC 的通用 Xray 工具集，包含两个脚本：
+仓库只包含两个脚本：
 
-| 脚本 | 用途 |
-| --- | --- |
-| `xray-installer.sh` | 首次安装 Xray，并创建直连、中转或落地节点 |
-| `xray-manager.sh` | 管理已有 Xray 配置、多个协议和多个用户 |
+- `xray-installer.sh`：首次安装 Xray，并创建 VLESS+Reality、Hysteria2 或 Shadowsocks 节点。
+- `xray-manager.sh`：按节点名称管理已有入站。
 
-脚本不绑定台湾、美国或固定端口，适合 NAT 和非 NAT 机器。
+支持 Alpine Linux / OpenRC、NAT 和非 NAT。脚本不会绑定台湾、美国或某个固定地址。
 
-## 快速开始
-
-### 首次安装
-
-在目标 Alpine 机器上以 `root` 执行：
+## 一键下载运行
 
 ```sh
 apk add --no-cache ca-certificates
@@ -25,40 +19,11 @@ else
   wget -q -O /root/xray-installer.sh \
     https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-installer.sh
 fi
-chmod +x /root/xray-installer.sh
+chmod 700 /root/xray-installer.sh
 /root/xray-installer.sh
 ```
 
-安装器会：
-
-- 动态获取 Xray 最新正式版本
-- 优先从 GitHub 下载，失败后尝试同版本 SourceForge 镜像
-- 安装 `unzip`、`openssl`、`jq` 等依赖；没有 `curl` 时使用 BusyBox `wget`
-- 支持 VLESS + Reality、Hysteria2、Shadowsocks
-- 支持直连、中转、落地模式
-- 支持 NAT / 非 NAT，并分别记录内部监听端口和外部映射端口
-- 自动生成 UUID、密码、Reality 密钥、Short ID 和导入链接
-- 创建节点时要求填写名称：必须以英文字母开头，后续只能使用英文字母和数字
-- 允许同一台 NAT 机器创建多个相同协议节点，但每个节点必须使用不同名称和内部端口
-- VLESS + Reality 默认 SNI 为 `www.bing.com`，可通过 `SERVER_NAME` 自定义；脚本拒绝使用 Cloudflare 域名
-- 创建 VLESS 节点时可扫描 Bing、Amazon、Yahoo、Samsung、NVIDIA 候选域名，或手动输入 SNI；选定域名同时作为 Reality 目标（443），Apple 不在自动候选列表中
-- 扫描在当前服务器上检查 TLS 1.3、X25519、H2、证书验证及证书消息大小，按本轮 TLS 建连时间推荐；不是客户端到节点的延迟测试，也不保证后续一直可用
-- 注册 OpenRC 开机自启
-- Hysteria2 安装后创建每日证书续期任务，续期成功自动重载 Xray
-
-默认端口：
-
-| 协议 | 默认端口 | 传输 |
-| --- | ---: | --- |
-| VLESS + Reality | 443 | TCP |
-| Hysteria2 | 443 | UDP |
-| Shadowsocks | 8388 | TCP |
-
-NAT 模式必须填写内部端口和外部映射端口。脚本不会自动创建路由器或服务商的 NAT 映射。已有配置会被保留，新节点会追加到现有配置；名称重复或内部端口冲突时脚本会停止。
-
-### 后续管理
-
-安装器完成后，在同一台机器运行管理器：
+管理器：
 
 ```sh
 if command -v curl >/dev/null 2>&1; then
@@ -69,38 +34,66 @@ else
   wget -q -O /root/xray-manager.sh \
     https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-manager.sh
 fi
-chmod +x /root/xray-manager.sh
+chmod 700 /root/xray-manager.sh
 /root/xray-manager.sh
 ```
 
-管理器会读取 `/etc/xray/config.json`，自动检测已有入站和用户，不会直接覆盖原配置。修改配置前会生成带时间戳的备份。安装器生成的节点名称会显示为入站标签和导入链接名称。
+## 安装器
 
-## 管理器功能
+安装器会动态查询 Xray 官方最新正式版本，优先 GitHub，无法访问时尝试同版本镜像；下载工具按 `curl`、`wget` 顺序选择。缺少 `unzip`、`openssl`、`jq`、证书包时会通过 `apk` 安装。
 
-- 列出已有入站、协议、端口和用户
-- 管理多个 VLESS、VMess、Trojan、Shadowsocks、Hysteria2 入站
-- 添加或删除用户
-- 启用 Xray StatsService 和本地 Handler API
-- 设置每月流量配额
-- 保存每个用户的最大在线数限制参数
-- 生成每小时运行的配额检查脚本
-- 达到月流量上限后移除对应入站中的用户并重载 Xray
-- 配置修改和配额任务使用锁，避免并发覆盖
+创建节点时会询问：
 
-统计 API 只绑定 `127.0.0.1:10085`，不会额外暴露公网管理端口。
+- 节点名称：英文字母开头，后续只能英文字母和数字。
+- 直连或中转模式。
+- VLESS+Reality、Hysteria2 或落地 Shadowsocks。
+- NAT 时填写内部监听端口和外部映射端口；非 NAT 时两者相同。
+- 客户端公网地址。
+- VLESS Reality SNI：可测试候选并推荐，也可以手动填写。禁止 Cloudflare 域名，默认不是 Microsoft。
 
-## 限制说明
+节点会注册 OpenRC 开机自启。Hysteria2 使用受信任证书，不打开 `insecure=1`。
 
-月流量限制依赖 Xray Stats API 和定时检查任务，不是内核瞬时硬断流。最大在线数会保存到管理器状态，供外部计费或人工策略使用；Xray 通用 API 没有可靠的按用户即时并发连接硬限制字段，因此管理器不会伪装成原生硬限制。
+默认内部端口：VLESS TCP `443`、Hysteria2 UDP `443`、Shadowsocks TCP `8388`。Reality 默认候选为 `www.bing.com`；候选测试也包含 Amazon、Yahoo、Samsung、NVIDIA。NAT 映射必须由服务商或路由器配置，脚本不会替你建立映射。同协议可以创建多个节点，但名称和内部端口不能冲突，包括已停用的节点。
 
-Hysteria2 使用受信任证书，不使用 `insecure=1`。使用 Hysteria2 时需要域名解析和证书申请所需的 TCP 80 访问。
+## 节点管理器
 
-## 服务管理
+管理器不按用户、email 或单独账号管理，只把入站 `tag` 作为节点名称。它会检测 `/etc/xray/config.json` 中已有的 VLESS、Shadowsocks 和 Hysteria 入站。
 
-```sh
-rc-service xray status
-rc-service xray restart
-/usr/local/bin/xray run -test -config /etc/xray/config.json
-```
+每个节点可以：
 
-默认服务输出丢弃到 `/dev/null`，不创建额外持久化日志。
+- 再次显示 `vless://`、`ss://` 或 `hysteria2://` 直接导入链接。
+- 保存客户端公网地址和外部端口；NAT 不会把内部端口误当成外部端口。
+- 开通节点字节统计，保存累计上行和下行字节。
+- 开启或关闭节点连接日志。
+- 设置最大连接数（`0` 表示无限制）。
+- 修改内部端口、外部端口、客户端地址、SNI、UUID/密码、中转 SS 出口。
+- 修改节点名称，并同步关联出口和路由标签。
+- 停用、启用或删除节点。
+
+配置修改先执行 `xray run -test -format json`，通过后才重载服务；重载失败会恢复本次操作前的临时配置。不会生成 `.bak` 或提供备份恢复菜单。重载会中断同一 Xray 进程中所有节点的现有连接。
+
+## 统计与日志说明
+
+节点统计使用 Xray 的 StatsService，按节点入站保存上下行**字节数**。它不是内核级瞬时计费，也不是每个 HTTP 请求的精确包数。
+
+分流后的节点日志只保存连接目标（域名/IP:端口）和连接状态，不保存 URL 路径、查询参数或请求正文。Xray 原始 access log 是全局文件，仍含来源地址和所有节点连接；管理器按精确入站标签采样到 `/etc/xray/logs/<节点名>-connections.log`。只在所有节点均关闭日志后，才关闭全局原始日志。无法辨识入站标签的日志行不会猜测归属。若客户端使用 Mux，底层连接日志不等于应用请求数。
+
+统计不是抓包：不能提供逐目标包数量或 HTTPS 完整网址。域名由客户端目标决定，客户端传 IP 时记录 IP，不额外打开嗅探。日志没有自动轮转，需要定期管理磁盘空间。日志默认权限为 `600`，目录为 `700`。
+
+开启统计、日志或非零连接限制后，管理器会安装每分钟运行的采样任务。任务使用 BusyBox `crond`，并注册为 OpenRC 默认服务。不对公网开放 API，统计 API 只绑定本机回环地址。没有任何单独用户、IP 限制或备份菜单。
+
+累计统计每分钟保存一次。意外退出、手动重启或掉电前尚未采样的流量可能丢失；统计不能用于要求零误差的账单。已有多凭据节点能按入站统计和启停，但不能自动选出唯一导入链接，管理器不会拆分用户。
+
+## 最大连接数
+
+`0` 表示无限制。非零值是每分钟检查一次的 TCP 节点软限制：超过上限时停用整个节点，不按 IP 限制，也不会即时拒绝第 N+1 条连接。HY2、UDP、Mux 内部逻辑流和共享端口节点不接受非零限制，避免伪装成 Xray 原生硬并发功能。
+
+连接限制需要 `ss`，缺少时执行 `apk add --no-cache iproute2-ss`。计数针对本机端口的 TCP ESTABLISHED 连接，不代表人数；包含本地连接，也不能区分尚未认证的连接。超限停用后需手动启用，不自动反复重启。
+
+## 默认文件
+
+- Xray 配置：`/etc/xray/config.json`
+- 管理器状态：`/etc/xray/manager-state.json`
+- 访问日志：`/etc/xray/logs/access.log`
+- 节点日志：`/etc/xray/logs/<节点名>-connections.log`
+- 管理器采样副本：`/etc/xray/manager.sh`
