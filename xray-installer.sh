@@ -16,7 +16,7 @@ CREATION_LOCK=""
 XRAY_VERSION="${XRAY_VERSION:-}"
 PUBLIC_PORT="${PUBLIC_PORT:-}"
 LISTEN_PORT="${LISTEN_PORT:-}"
-SERVER_NAME="${SERVER_NAME:-www.microsoft.com}"
+SERVER_NAME="${SERVER_NAME:-www.bing.com}"
 PUBLIC_HOST=""
 NODE_NAME=""
 
@@ -84,6 +84,94 @@ ask_secret() {
 }
 rand_hex() { openssl rand -hex "$1"; }
 rand_password() { openssl rand -base64 24 | tr -d '=+/'; }
+sni_valid() {
+  case "$1" in
+    *[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]*) return 1 ;;
+  esac
+  printf '%s\n' "$1" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
+}
+probe_sni() {
+  local host="$1" log="$WORK_DIR/sni-probe.txt" cert_hex cert_bytes speed
+  # Probe with X25519 and leave headroom below older REALITY's 8192-byte buffer.
+  timeout 10 openssl s_client -connect "$host:443" -servername "$host" \
+    -tls1_3 -groups X25519 -alpn h2 -verify_hostname "$host" \
+    -verify_return_error -msg < /dev/null > "$log" 2>&1 || true
+  if ! grep -q 'ALPN protocol: h2' "$log" ||
+     ! grep -q 'Verify return code: 0 (ok)' "$log" ||
+     ! grep -Eq '^<<< .*Finished' "$log"; then
+    echo "$host: 未通过 TLS 1.3 / H2 / 证书校验或连接超时。" >&2
+    return 1
+  fi
+  cert_hex="$(awk '/^<<< .*], Certificate$/ {
+    for (i=1;i<=NF;i++) if ($i=="[length") {
+      v=$(i+1); gsub(/[^0-9a-fA-F]/,"",v); print v; exit
+    }
+  }' "$log")"
+  case "$cert_hex" in ''|*[!0-9a-fA-F]*) echo "$host: 无法检查证书消息大小，跳过。" >&2; return 1 ;; esac
+  cert_bytes="$(printf '%d' "0x$cert_hex")"
+  if [ "$cert_bytes" -gt 7000 ]; then
+    echo "$host: 证书消息 ${cert_bytes} 字节，超过保守阈值 7000，跳过。" >&2
+    return 1
+  fi
+  speed="$(curl --noproxy '*' --connect-timeout 5 --max-time 10 \
+    --tlsv1.3 --tls-max 1.3 -sS -o /dev/null -w '%{time_appconnect}' \
+    "https://$host/" 2>/dev/null)" || {
+      echo "$host: HTTPS 测速失败，跳过。" >&2; return 1;
+    }
+  printf '%s\n' "$speed" | grep -Eq '^[0-9]+\.[0-9]+$' || return 1
+  echo "$host: 通过；TLS 建连 ${speed}s；证书消息 ${cert_bytes} 字节。" >&2
+  printf '%s\t%s\n' "$speed" "$host"
+}
+choose_reality_sni() {
+  local mode host selected choice recommended index
+  command -v timeout >/dev/null 2>&1 || die "缺少 timeout，请安装 BusyBox。"
+  echo "Reality 目标/SNI：默认候选 www.bing.com，不使用 www.microsoft.com 或 Cloudflare。"
+  mode="$(ask '1. 测试候选网站并推荐  2. 手动输入 SNI' 1)"
+  case "$mode" in
+    1)
+      : > "$WORK_DIR/sni-results.tsv"
+      # These are candidates, not a permanent compatibility allowlist.
+      for host in www.bing.com www.apple.com www.amazon.com www.yahoo.com www.samsung.com www.nvidia.com; do
+        probe_sni "$host" >> "$WORK_DIR/sni-results.tsv" || true
+      done
+      sort -n "$WORK_DIR/sni-results.tsv" > "$WORK_DIR/sni-ranked.tsv"
+      if [ -s "$WORK_DIR/sni-ranked.tsv" ]; then
+        recommended="$(awk 'NR==1 {print $2}' "$WORK_DIR/sni-ranked.tsv")"
+        echo "推荐: $recommended（本轮通过检查且 TLS 建连最快，不代表端到端代理延迟最佳）。"
+        awk '{printf "  %d. %s (%ss)\n", NR, $2, $1}' "$WORK_DIR/sni-ranked.tsv"
+        echo "  0. 手动输入"
+        while :; do
+          choice="$(ask '选择候选编号' 1)"
+          case "$choice" in
+            0) break ;;
+            ''|*[!0-9]*) echo "请输入列表中的编号。" ;;
+            *)
+              selected="$(awk -v n="$choice" 'NR==n {print $2}' "$WORK_DIR/sni-ranked.tsv")"
+              if [ -n "$selected" ]; then SERVER_NAME="$selected"; return; fi
+              echo "编号无效。"
+              ;;
+          esac
+        done
+      else
+        echo "没有候选通过检查，请手动输入并测试。"
+      fi
+      ;;
+    2) ;;
+    *) die "SNI 模式只能是 1 或 2。" ;;
+  esac
+  while :; do
+    host="$(ask '自定义 SNI 域名（目标同为此域名:443）' "$SERVER_NAME")"
+    if ! sni_valid "$host"; then
+      echo "请输入有效域名，不能使用 IP、通配符或 Cloudflare 域名。"
+      continue
+    fi
+    if probe_sni "$host" > "$WORK_DIR/sni-results.tsv"; then
+      SERVER_NAME="$host"
+      return
+    fi
+    echo "目标未通过检查，请换一个域名。"
+  done
+}
 reality_key_field() {
   awk -F ':' -v field="$1" '
     {
@@ -115,6 +203,9 @@ cleanup() {
     rm -f "$WORK_DIR/xray.zip"
     rm -f "$WORK_DIR/xray"
     rm -f "$WORK_DIR/node.json"
+    rm -f "$WORK_DIR/sni-probe.txt"
+    rm -f "$WORK_DIR/sni-results.tsv"
+    rm -f "$WORK_DIR/sni-ranked.tsv"
     rmdir "$WORK_DIR" 2>/dev/null || true
   fi
   [ -z "$CANDIDATE_CONFIG" ] || rm -f "$CANDIDATE_CONFIG"
@@ -543,14 +634,14 @@ main() {
   echo "部署参数: ${role_name} / ${protocol_name}"
   echo "本机监听 ${transport} ${LISTEN_PORT}；对外访问 ${transport} ${PUBLIC_PORT}"
   case "$protocol:$role" in
-    1:direct|1:relay) make_vless_config "$role" ;;
+    1:direct|1:relay) choose_reality_sni; make_vless_config "$role" ;;
     2:direct|2:relay) make_hy2_config "$role" ;;
     ss:landing) make_landing_config ;;
     *) die "无效的协议选择" ;;
   esac
   echo "[4/6] 检查配置..."
   stage_node_config
-  "$XRAY_BIN" run -test -config "$CANDIDATE_CONFIG"
+  "$XRAY_BIN" run -test -format json -config "$CANDIDATE_CONFIG"
   backup_path=""
   if [ -e "$XRAY_DIR/config.json" ]; then
     backup_path="$(mktemp "$XRAY_DIR/config.json.bak.XXXXXX")"
