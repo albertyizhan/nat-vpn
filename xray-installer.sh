@@ -9,15 +9,27 @@ set -eu
 XRAY_DIR="${XRAY_DIR:-/usr/local/etc/xray}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 SERVICE_NAME="xray"
-WORK_DIR="/tmp/xray-installer"
+WORK_DIR=""
+GENERATED_CONFIG=""
+CANDIDATE_CONFIG=""
+CREATION_LOCK=""
 XRAY_VERSION="${XRAY_VERSION:-}"
 PUBLIC_PORT="${PUBLIC_PORT:-}"
 LISTEN_PORT="${LISTEN_PORT:-}"
-SERVER_NAME="${SERVER_NAME:-www.cloudflare.com}"
+SERVER_NAME="${SERVER_NAME:-www.microsoft.com}"
 PUBLIC_HOST=""
+NODE_NAME=""
 
 die() { echo "错误: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"; }
+validate_reality_server_name() {
+  case "$SERVER_NAME" in
+    *[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]*)
+      die "VLESS + Reality 的 SNI 禁止使用 Cloudflare 域名，请改用其他真实 TLS 域名。" ;;
+  esac
+  printf '%s\n' "$SERVER_NAME" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]*$' ||
+    die "Reality SNI 格式无效。"
+}
 ask() {
   prompt="$1"
   default="${2:-}"
@@ -41,6 +53,33 @@ ask_port() {
       return
     fi
     echo "请输入 1–65535 的端口号。" >&2
+  done
+}
+ask_node_name() {
+  local value
+  while :; do
+    value="$(ask "节点名称（英文字母开头，只能包含英文字母和数字）")"
+    printf '%s\n' "$value" | grep -Eq '^[A-Za-z][A-Za-z0-9]*$' &&
+      { printf '%s' "$value"; return; }
+    echo "名称无效：必须以英文字母开头，后续只能使用英文字母和数字。" >&2
+  done
+}
+ask_endpoint() {
+  local value
+  while :; do
+    value="$(ask "$1" "${2:-}")"
+    printf '%s\n' "$value" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]*$' &&
+      { printf '%s' "$value"; return; }
+    echo "地址格式无效：只允许字母、数字、点、冒号、下划线和连字符。" >&2
+  done
+}
+ask_secret() {
+  local value
+  while :; do
+    value="$(ask "$1")"
+    printf '%s\n' "$value" | grep -Eq '^[A-Za-z0-9._~+/=-]+$' &&
+      { printf '%s' "$value"; return; }
+    echo "密钥包含不安全字符，请使用字母、数字和常见密码字符。" >&2
   done
 }
 rand_hex() { openssl rand -hex "$1"; }
@@ -71,10 +110,15 @@ detect_public_host() {
 }
 
 cleanup() {
-  rm -f "$WORK_DIR/release.json"
-  rm -f "$WORK_DIR/xray.zip"
-  rm -f "$WORK_DIR/xray"
-  rmdir "$WORK_DIR" 2>/dev/null || true
+  if [ -n "$WORK_DIR" ]; then
+    rm -f "$WORK_DIR/release.json"
+    rm -f "$WORK_DIR/xray.zip"
+    rm -f "$WORK_DIR/xray"
+    rm -f "$WORK_DIR/node.json"
+    rmdir "$WORK_DIR" 2>/dev/null || true
+  fi
+  [ -z "$CANDIDATE_CONFIG" ] || rm -f "$CANDIDATE_CONFIG"
+  [ -z "$CREATION_LOCK" ] || rmdir "$CREATION_LOCK" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -174,6 +218,19 @@ EOF
   rc-update add "$SERVICE_NAME" default >/dev/null
 }
 
+write_cert_renewal() {
+  mkdir -p /etc/periodic/daily
+  cat > /etc/periodic/daily/xray-cert-renew <<EOF
+#!/bin/sh
+certbot renew --quiet --deploy-hook "rc-service ${SERVICE_NAME} restart"
+EOF
+  chmod 700 /etc/periodic/daily/xray-cert-renew
+  if command -v crond >/dev/null 2>&1; then
+    rc-service crond start >/dev/null 2>&1 || true
+    rc-update add crond default >/dev/null 2>&1 || true
+  fi
+}
+
 make_vless_config() {
   local role="$1"
   local uuid keys private public short_id ss_address ss_port ss_password
@@ -188,14 +245,15 @@ make_vless_config() {
   short_id="$(rand_hex 8)"
   if [ "$role" = relay ]; then
     echo "上游落地协议: Shadowsocks，aes-128-gcm；请先部署落地节点。"
-    ss_address="$(ask '落地节点公网 IP/域名')"
+    ss_address="$(ask_endpoint '落地节点公网 IP/域名')"
     ss_port="$(ask_port '落地节点对外 SS 端口（NAT 时填写外部映射端口）')"
-    ss_password="$(ask '落地节点生成的 SS 密码')"
+    ss_password="$(ask_secret '落地节点生成的 SS 密码')"
     [ -n "$ss_password" ] || die "SS 密码不能为空"
-    cat > "$XRAY_DIR/config.json" <<EOF
+    cat > "$GENERATED_CONFIG" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
+    "tag": "${NODE_NAME}",
     "listen": "0.0.0.0",
     "port": ${LISTEN_PORT},
     "protocol": "vless",
@@ -225,10 +283,11 @@ make_vless_config() {
 }
 EOF
   else
-    cat > "$XRAY_DIR/config.json" <<EOF
+    cat > "$GENERATED_CONFIG" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
+    "tag": "${NODE_NAME}",
     "listen": "0.0.0.0",
     "port": ${LISTEN_PORT},
     "protocol": "vless",
@@ -250,17 +309,19 @@ EOF
 }
 EOF
   fi
-  CLIENT_HOST="$(ask '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
-  LINK="vless://${uuid}@${CLIENT_HOST}:${PUBLIC_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${public}&sid=${short_id}&type=tcp#Alpine-Xray"
+  CLIENT_HOST="$(ask_endpoint '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
+  LINK="vless://${uuid}@${CLIENT_HOST}:${PUBLIC_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${public}&sid=${short_id}&type=tcp#${NODE_NAME}"
 }
 
 make_hy2_config() {
   local role="$1"
   local password cert_key cert_pem uuid email ss_address ss_port ss_password
   password="$(rand_password)"
-  cert_cn="$(ask 'Hysteria2 证书域名（必须已解析到本机，不能填 IP）')"
+  cert_cn="$(ask_endpoint 'Hysteria2 证书域名（必须已解析到本机，不能填 IP）')"
   [ -n "$cert_cn" ] || die "Hysteria2 必须使用域名证书"
   case "$cert_cn" in *.*) ;; *) die "证书域名格式不正确: ${cert_cn}" ;; esac
+  printf '%s\n' "$cert_cn" | grep -Eq '^[0-9.]+$' &&
+    die "Hysteria2 证书必须使用域名，不能填 IP 地址。"
   email="$(ask 'Let''s Encrypt 通知邮箱')"
   [ -n "$email" ] || die "邮箱不能为空"
   echo "安装 Certbot 并申请受信任证书；请确保公网 TCP 80 已转发到本机。"
@@ -272,14 +333,15 @@ make_hy2_config() {
   [ -s "$cert_key" ] && [ -s "$cert_pem" ] || die "证书申请成功但文件不存在"
   if [ "$role" = relay ]; then
     echo "上游落地协议: Shadowsocks，aes-128-gcm；请先部署落地节点。"
-    ss_address="$(ask '落地节点公网 IP/域名')"
+    ss_address="$(ask_endpoint '落地节点公网 IP/域名')"
     ss_port="$(ask_port '落地节点对外 SS 端口（NAT 时填写外部映射端口）')"
-    ss_password="$(ask '落地节点生成的 SS 密码')"
+    ss_password="$(ask_secret '落地节点生成的 SS 密码')"
     [ -n "$ss_password" ] || die "SS 密码不能为空"
-    cat > "$XRAY_DIR/config.json" <<EOF
+    cat > "$GENERATED_CONFIG" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
+    "tag": "${NODE_NAME}",
     "listen": "0.0.0.0",
     "port": ${LISTEN_PORT},
     "protocol": "hysteria",
@@ -298,10 +360,11 @@ make_hy2_config() {
 }
 EOF
   else
-    cat > "$XRAY_DIR/config.json" <<EOF
+    cat > "$GENERATED_CONFIG" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
+    "tag": "${NODE_NAME}",
     "listen": "0.0.0.0",
     "port": ${LISTEN_PORT},
     "protocol": "hysteria",
@@ -317,18 +380,19 @@ EOF
 }
 EOF
   fi
-  CLIENT_HOST="$(ask '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
-  LINK="hysteria2://${password}@${CLIENT_HOST}:${PUBLIC_PORT}/?sni=${cert_cn}#Alpine-Hysteria2"
+  CLIENT_HOST="$(ask_endpoint '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
+  LINK="hysteria2://${password}@${CLIENT_HOST}:${PUBLIC_PORT}/?sni=${cert_cn}#${NODE_NAME}"
 }
 
 make_landing_config() {
   local password method client_host userinfo
   password="$(rand_password)"
   method="aes-128-gcm"
-  cat > "$XRAY_DIR/config.json" <<EOF
+  cat > "$GENERATED_CONFIG" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
+    "tag": "${NODE_NAME}",
     "listen": "0.0.0.0",
     "port": ${LISTEN_PORT},
     "protocol": "shadowsocks",
@@ -337,19 +401,100 @@ make_landing_config() {
   "outbounds": [{"protocol": "freedom"}]
 }
 EOF
-  client_host="$(ask '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
+  client_host="$(ask_endpoint '客户端连接地址（公网 IP/域名）' "$PUBLIC_HOST")"
   userinfo="$(printf '%s' "${method}:${password}" | openssl base64 -A)"
-  LINK="ss://${userinfo}@${client_host}:${PUBLIC_PORT}#Alpine-SS"
+  LINK="ss://${userinfo}@${client_host}:${PUBLIC_PORT}#${NODE_NAME}"
   echo "落地协议: Shadowsocks ${method}"
   echo "SS 密码: ${password}"
 }
 
+check_existing_config() {
+  [ -e "$XRAY_DIR/config.json" ] || return 0
+  jq -e '
+    type == "object" and
+    ((.inbounds // []) | type == "array") and
+    ((.outbounds // []) | type == "array")
+  ' "$XRAY_DIR/config.json" >/dev/null ||
+    die "已有配置不是可解析的 JSON 对象，已停止，不会覆盖。"
+}
+
+name_available() {
+  [ -e "$XRAY_DIR/config.json" ] || return 0
+  jq -e --arg name "$1" '
+    ([.inbounds[]?.tag, .outbounds[]?.tag] |
+      any(. == $name or . == ($name + "Out"))) | not
+  ' "$XRAY_DIR/config.json" >/dev/null
+}
+
+port_available() {
+  [ -e "$XRAY_DIR/config.json" ] || return 0
+  # Conservatively reserve an internal port across all transports/listeners.
+  jq -e --argjson port "$1" '
+    [.inbounds[]?.port |
+      if type == "number" then . != $port
+      elif type == "string" then
+        split(",") | all(
+          split("-") | map(tonumber) |
+          if length == 1 then .[0] != $port
+          else ($port < .[0] or $port > .[1]) end)
+      else false end] | all
+  ' "$XRAY_DIR/config.json" >/dev/null
+}
+
+merge_node_config() {
+  local existing="$1" node="$2" candidate="$3"
+  jq --arg name "$NODE_NAME" --slurpfile node "$node" '
+    $node[0] as $new |
+    .inbounds = ((.inbounds // []) + $new.inbounds) |
+    .outbounds = ((.outbounds // []) +
+      ($new.outbounds | map(.tag = ($name + "Out")))) |
+    .routing = (.routing // {}) |
+    .routing.rules = [{
+      type: "field", inboundTag: [$name], outboundTag: ($name + "Out")
+    }] + (.routing.rules // [])
+  ' "$existing" > "$candidate"
+}
+
+stage_node_config() {
+  CANDIDATE_CONFIG="$(mktemp "$XRAY_DIR/.config-candidate.XXXXXX")"
+  if [ -e "$XRAY_DIR/config.json" ]; then
+    merge_node_config "$XRAY_DIR/config.json" "$GENERATED_CONFIG" "$CANDIDATE_CONFIG"
+  else
+    # The generated config is also the base for a first install.
+    jq --arg name "$NODE_NAME" '
+      .outbounds |= map(.tag = ($name + "Out")) |
+      .routing = {rules:[{
+        type:"field", inboundTag:[$name], outboundTag:($name + "Out")
+      }]}
+    ' "$GENERATED_CONFIG" > "$CANDIDATE_CONFIG"
+  fi
+}
+
 main() {
   need_root
-  install_deps
-  download_xray
+  validate_reality_server_name
+  umask 077
   mkdir -p "$XRAY_DIR"
+  mkdir "$XRAY_DIR/.creation-lock" 2>/dev/null ||
+    die "另一个创建任务正在运行，或上次异常退出留下了 $XRAY_DIR/.creation-lock；确认无人运行后手动处理。"
+  CREATION_LOCK="$XRAY_DIR/.creation-lock"
+  WORK_DIR="$(mktemp -d /tmp/xray-installer.XXXXXX)"
+  GENERATED_CONFIG="$WORK_DIR/node.json"
+  install_deps
+  check_existing_config
+  if [ -x "$XRAY_BIN" ]; then
+    echo "[2/6] 复用已安装的 Xray，不自动替换正在使用的程序。"
+    "$XRAY_BIN" version | head -n1
+  else
+    download_xray
+  fi
   echo "[3/6] 选择部署模式"
+  echo "允许多个同协议节点；每个节点使用独立名称和内部端口。"
+  while :; do
+    NODE_NAME="$(ask_node_name)"
+    name_available "$NODE_NAME" && break
+    echo "名称或对应出口标签已存在，请使用其他名称。"
+  done
   mode="$(ask '1. 直连模式  2. 中转模式' 1)"
   case "$mode" in 1|2) ;; *) die "模式只能是 1 或 2" ;; esac
   if [ "$mode" = 1 ]; then
@@ -390,6 +535,11 @@ main() {
       ;;
     *) die "网络类型只能是 1 或 2" ;;
   esac
+  while ! port_available "$LISTEN_PORT"; do
+    echo "内部端口 ${LISTEN_PORT} 已被配置中的入站占用，请换一个端口。"
+    LISTEN_PORT="$(ask_port '新的内部监听端口')"
+    if [ "$network_mode" = 2 ]; then PUBLIC_PORT="$LISTEN_PORT"; fi
+  done
   echo "部署参数: ${role_name} / ${protocol_name}"
   echo "本机监听 ${transport} ${LISTEN_PORT}；对外访问 ${transport} ${PUBLIC_PORT}"
   case "$protocol:$role" in
@@ -399,12 +549,33 @@ main() {
     *) die "无效的协议选择" ;;
   esac
   echo "[4/6] 检查配置..."
-  "$XRAY_BIN" run -test -config "$XRAY_DIR/config.json"
+  stage_node_config
+  "$XRAY_BIN" run -test -config "$CANDIDATE_CONFIG"
+  backup_path=""
+  if [ -e "$XRAY_DIR/config.json" ]; then
+    backup_path="$(mktemp "$XRAY_DIR/config.json.bak.XXXXXX")"
+    cp "$XRAY_DIR/config.json" "$backup_path"
+    echo "原配置已备份: $backup_path"
+  fi
+  mv "$CANDIDATE_CONFIG" "$XRAY_DIR/config.json"
+  CANDIDATE_CONFIG=""
   echo "[5/6] 注册 OpenRC..."
   write_service
-  rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || rc-service "$SERVICE_NAME" start
+  if [ "$protocol" = 2 ]; then
+    write_cert_renewal
+  fi
+  if ! rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 &&
+     ! rc-service "$SERVICE_NAME" start; then
+    if [ -n "$backup_path" ]; then
+      cp "$backup_path" "$XRAY_DIR/config.json"
+      rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || true
+      die "启动失败，已恢复原配置；备份保留在 $backup_path"
+    fi
+    die "启动失败，请检查端口占用和服务配置。"
+  fi
   echo "[6/6] 完成"
   echo
+  echo "节点名称: ${NODE_NAME}"
   echo "角色: ${role_name}；协议: ${protocol_name}"
   echo "监听端口: ${transport} ${LISTEN_PORT}"
   if [ "$network_mode" = 1 ]; then
