@@ -5,7 +5,7 @@
 - `xray-installer.sh`：首次安装 Xray，并创建 VLESS+Reality、Hysteria2 或 Shadowsocks 节点。
 - `xray-manager.sh`：按节点名称管理已有入站。
 
-支持 Alpine Linux / OpenRC、NAT 和非 NAT。脚本不会绑定台湾、美国或某个固定地址。
+支持 Alpine Linux / OpenRC、NAT 和非 NAT。
 
 ## 一键下载运行
 
@@ -105,3 +105,5 @@ sh /root/xray-manager.sh
 - 访问日志：`/etc/xray/logs/access.log`
 - 节点日志：`/etc/xray/logs/<节点名>-connections.log`
 - 管理器采样副本：`/etc/xray/manager.sh`
+
+--本脚本由gpt-6.1 sol创建，记得多提issues
