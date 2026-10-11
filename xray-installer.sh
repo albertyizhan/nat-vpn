@@ -340,8 +340,9 @@ cleanup() {
 trap cleanup EXIT
 
 install_deps() {
-  echo "[1/6] 安装依赖..."
+  echo "[1/6] 准备校时与基础依赖..."
   detect_platform
+  check_system_time
   mkdir -p "$XRAY_DIR"
   case "$PKG" in
     apk) install_packages ca-certificates wget curl unzip openssl jq libstdc++ libgcc coreutils ;;
@@ -358,30 +359,44 @@ install_deps() {
 }
 
 check_system_time() {
-  local drift existing_time=0
-  if pidof ntpd >/dev/null 2>&1 || { [ "$INIT" = systemd ] && systemctl is-active --quiet systemd-timesyncd; }; then
-    existing_time=1
-  fi
+  local attempt peers
   echo "检查系统时间（当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S')）..."
-  command -v chronyc >/dev/null 2>&1 && command -v chronyd >/dev/null 2>&1 ||
-    install_packages chrony
-  if [ "$existing_time" = 1 ] && ! pidof chronyd >/dev/null 2>&1; then
-    # Do not replace an already running NTP daemon.
-    printf '%s\n' 'pool pool.ntp.org iburst' 'pool time.google.com iburst' \
-      > "$WORK_DIR/time-probe.conf"
-    echo "已有其他校时服务，保留原服务；使用 chronyd 只查询偏差，不修改系统时间。"
-    if chronyd -Q -t 25 -f "$WORK_DIR/time-probe.conf" > "$WORK_DIR/time-probe.log" 2>&1; then
-      drift="$(awk '/System clock wrong by/ {
-        for(i=1;i<=NF;i++) if($i=="by") {print $(i+1); exit}
-      }' "$WORK_DIR/time-probe.log")"
-      if printf '%s\n' "$drift" | grep -Eq '^-?[0-9]+([.][0-9]+)?$' &&
-         awk -v v="$drift" 'BEGIN {if(v<0)v=-v; exit !(v<=1)}'; then
-        echo "NTP 查询通过，系统偏差 ${drift}s（不超过 1 秒）。"
+  if [ "$INIT" = systemd ] && systemctl is-active --quiet systemd-timesyncd; then
+    echo "复用 systemd-timesyncd，等待同步（最多约 30 秒）。"
+    attempt=0
+    while [ "$attempt" -lt 15 ]; do
+      if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; then
+        echo "已有服务报告系统时间已同步。"
         return
       fi
+      sleep 2
+      attempt=$((attempt + 1))
+    done
+  elif { command -v pidof >/dev/null 2>&1 && pidof ntpd >/dev/null 2>&1; } ||
+       { [ "$INIT" = systemd ] && { systemctl is-active --quiet ntp || systemctl is-active --quiet ntpd || systemctl is-active --quiet ntpsec; }; }; then
+    echo "复用已有 ntpd，不安装或替换校时服务。"
+    if command -v ntpq >/dev/null 2>&1; then
+      attempt=0
+      while [ "$attempt" -lt 15 ]; do
+        peers="$(ntpq -pn 2>/dev/null || true)"
+        if printf '%s\n' "$peers" | awk '
+          /^\*/ && NF>=10 {v=$9; if(v<0)v=-v; if(v<=1000) ok=1}
+          END {exit !ok}'; then
+          echo "ntpd 已选择同步源，时间偏差不超过 1 秒。"
+          return
+        fi
+        sleep 2
+        attempt=$((attempt + 1))
+      done
+    else
+      echo "缺少 ntpq，无法确认已有 ntpd 的同步状态。"
     fi
-    cat "$WORK_DIR/time-probe.log"
   else
+    # Do not install chrony while another time service is active.
+    if ! command -v chronyc >/dev/null 2>&1 || ! command -v chronyd >/dev/null 2>&1; then
+      install_packages chrony ||
+        die "无法安装校时工具。若系统时间错误导致 HTTPS 失败，请先从宿主机或控制台修正时间，再重试；不会关闭 TLS 校验。"
+    fi
     if [ "$PKG" = apk ]; then
       [ -x /etc/init.d/chronyd ] || install_packages chrony-openrc
     fi
@@ -908,7 +923,6 @@ main() {
   WORK_DIR="$(mktemp -d /tmp/xray-installer.XXXXXX)"
   GENERATED_CONFIG="$WORK_DIR/node.json"
   install_deps
-  check_system_time
   if [ -e "$XRAY_DIR/manager-state.json" ]; then
     jq -e 'type=="object" and ((.nodes // {}) | type=="object")' "$XRAY_DIR/manager-state.json" >/dev/null ||
       die "管理器状态文件损坏，未覆盖。请检查 $XRAY_DIR/manager-state.json"
