@@ -186,7 +186,7 @@ begin() {
   jq --slurpfile config "$CONFIG" '
     .nodes = (.nodes // {}) | del(.users) |
     reduce ($config[0].inbounds[] |
-      select(.protocol=="vless" or .protocol=="shadowsocks" or .protocol=="hysteria") |
+      select(.protocol=="vless" or .protocol=="shadowsocks") |
       select((.tag // "") | test("^[A-Za-z][A-Za-z0-9]*$"))) as $i
       (.; .nodes[$i.tag] = ((.nodes[$i.tag] // {}) +
         {inbound:$i, disabled:false}))
@@ -310,7 +310,7 @@ persist_node() {
   config_edit '
     if $state[0].nodes[$tag].disabled==true then
       .inbounds |= map(select(.tag != $tag))
-    elif any(.inbounds[]; .tag==$tag) then
+    elif any(.inbounds[]; .tag==$tag and (.protocol=="vless" or .protocol=="shadowsocks")) then
       .inbounds |= map(if .tag==$tag then $state[0].nodes[$tag].inbound else . end)
     else .inbounds += [$state[0].nodes[$tag].inbound] end
   ' --arg tag "$1" --slurpfile state "$TX/state.json"
@@ -415,7 +415,7 @@ tcp_limit_supported() {
   transport="$(node_value "$1" '.streamSettings.network // "tcp"')"
   case "$proto:$network:$transport" in
     vless:*:tcp|vless:*:raw|shadowsocks:tcp:tcp) ;;
-    *) die "此版本仅支持 TCP VLESS/SS 的连接数软限制；HY2、UDP 或其他传输不接受非零上限。" ;;
+    *) die "此版本仅支持 TCP VLESS/SS 的连接数软限制；UDP 或其他传输不接受非零上限。" ;;
   esac
   port="$(node_value "$1" '.port')"
   valid_port "$port" || die "连接限制要求单个数值监听端口。"
@@ -609,20 +609,6 @@ show_link() {
       userinfo="$(printf '%s' "$method:$password" | base64 | tr '+/' '-_' | tr -d '\n=')"
       printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$host" "$port" "$tag"
       ;;
-    hysteria)
-      [ "$(node_value "$tag" '.settings.users | length')" -eq 1 ] ||
-        die "HY2 节点必须只有一份认证凭据。"
-      password="$(node_value "$tag" '.settings.users[0].auth // ""')"
-      sni="$(state_value "$tag" '.sni // ""')"
-      if [ -z "$sni" ]; then
-        sni="$(ask "HY2 证书域名/SNI（必须匹配已有可信证书）")"
-        valid_sni "$sni" || die "域名格式无效。"
-        state_edit '.nodes[$tag].sni=$sni' --arg tag "$tag" --arg sni "$sni"
-        save_only
-      fi
-      [ -n "$password" ] || die "HY2 auth 缺失。"
-      printf 'hysteria2://%s@%s:%s/?sni=%s#%s\n' "$(uri "$password")" "$host" "$port" "$(uri "$sni")" "$tag"
-      ;;
     *) die "不支持此协议的链接。" ;;
   esac
 }
@@ -744,13 +730,6 @@ edit_config() {
           persist_node "$tag"; apply
           echo "已更新 SNI 与目标；请确认新目标支持 Reality 所需 TLS 特性。"
           ;;
-        hysteria)
-          command -v openssl >/dev/null 2>&1 || die "缺少 openssl。"
-          cert="$(node_value "$tag" '.streamSettings.tlsSettings.certificates[0].certificateFile // ""')"
-          [ -r "$cert" ] || die "证书文件不可读。"
-          openssl x509 -in "$cert" -noout -checkhost "$value" >/dev/null || die "新域名与现有证书不匹配，未修改。"
-          state_edit '.nodes[$tag].sni=$value' --arg tag "$tag" --arg value "$value"; save_only
-          ;;
         *) die "SS 没有 SNI。" ;;
       esac
       ;;
@@ -765,9 +744,7 @@ edit_config() {
         shadowsocks)
           [ "$(node_value "$tag" '.settings.password // ""')" != "" ] || die "不是单密码 SS。"
           state_edit '.nodes[$tag].inbound.settings.password=$value' --arg tag "$tag" --arg value "$value" ;;
-        hysteria)
-          [ "$(node_value "$tag" '.settings.users | length')" -eq 1 ] || die "多个凭据的节点不提供此快捷修改。"
-          state_edit '.nodes[$tag].inbound.settings.users[0].auth=$value' --arg tag "$tag" --arg value "$value" ;;
+
       esac
       persist_node "$tag"; apply
       ;;
@@ -829,9 +806,9 @@ run_action() {
 
 list_nodes() {
   {
-    [ ! -r "$STATE" ] || jq -c '.nodes // {} | to_entries[] | {tag:.key, protocol:.value.inbound.protocol,
+    [ ! -r "$STATE" ] || jq -c '.nodes // {} | to_entries[] | select(.value.inbound.protocol=="vless" or .value.inbound.protocol=="shadowsocks") | {tag:.key, protocol:.value.inbound.protocol,
       port:.value.inbound.port, disabled:(.value.disabled // false)}' "$STATE"
-    jq -c '.inbounds[] | select(.protocol=="vless" or .protocol=="shadowsocks" or .protocol=="hysteria") |
+    jq -c '.inbounds[] | select(.protocol=="vless" or .protocol=="shadowsocks") |
       {tag,protocol,port,disabled:false}' "$CONFIG"
   } | jq -rs '
     group_by(.tag) | .[] | last |
@@ -840,8 +817,8 @@ list_nodes() {
 }
 
 node_exists() {
-  jq -e --arg tag "$1" 'any(.inbounds[]; .tag==$tag)' "$CONFIG" >/dev/null && return 0
-  [ -r "$STATE" ] && jq -e --arg tag "$1" '.nodes[$tag].inbound!=null' "$STATE" >/dev/null
+  jq -e --arg tag "$1" 'any(.inbounds[]; .tag==$tag and (.protocol=="vless" or .protocol=="shadowsocks"))' "$CONFIG" >/dev/null && return 0
+  [ -r "$STATE" ] && jq -e --arg tag "$1" '(.nodes[$tag].inbound.protocol=="vless" or .nodes[$tag].inbound.protocol=="shadowsocks")' "$STATE" >/dev/null
 }
 
 node_menu() {
