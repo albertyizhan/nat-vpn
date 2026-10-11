@@ -21,6 +21,8 @@ LISTEN_PORT="${LISTEN_PORT:-}"
 SERVER_NAME="${SERVER_NAME:-www.bing.com}"
 PUBLIC_HOST=""
 NODE_NAME=""
+HY2_AUTO_RENEW=0
+HY2_CERT_FINGERPRINT=""
 
 die() { echo "错误: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"; }
@@ -125,6 +127,21 @@ ask_secret() {
     echo "密钥包含不安全字符，请使用字母、数字和常见密码字符。" >&2
   done
 }
+ask_cloudflare_token() (
+  local tty_state token
+  [ -r /dev/tty ] && [ -w /dev/tty ] || die "输入 API Token 需要交互终端"
+  tty_state="$(stty -g < /dev/tty)" || die "无法读取终端状态"
+  trap 'stty "$tty_state" < /dev/tty' EXIT
+  trap 'exit 1' HUP INT TERM
+  printf 'Cloudflare API Token（隐藏输入）: ' > /dev/tty
+  stty -echo < /dev/tty
+  IFS= read -r token < /dev/tty || die "未读取到 API Token"
+  printf '\n' > /dev/tty
+  case "$token" in
+    ''|*[!A-Za-z0-9_-]*) die "API Token 不能为空，且只能包含字母、数字、下划线和连字符" ;;
+  esac
+  printf '%s' "$token"
+)
 fetch_to() {
   local output="$1" url="$2"
   timeout 180 wget --timeout=15 --tries=2 -O "$output" "$url"
@@ -523,21 +540,95 @@ EOF
 make_hy2_config() {
   local role="$1"
   local password cert_key cert_pem uuid email ss_address ss_port ss_password
+  local cf_token cf_credentials renewal_config cert_mode cert_source key_source cert_dir
   password="$(rand_password)"
-  cert_cn="$(ask_endpoint 'Hysteria2 证书域名（必须已解析到本机，不能填 IP）')"
+  echo "证书方式: 1. Cloudflare 自动 DNS 验证  2. 手动 DNS 验证  3. 导入已有受信任证书  4. 自签名 + 客户端指纹校验"
+  cert_mode="$(ask '选择证书方式' 1)"
+  case "$cert_mode" in 1|2|3|4) ;; *) die "证书方式只能是 1–4" ;; esac
+  HY2_AUTO_RENEW=0
+  HY2_CERT_FINGERPRINT=""
+  cert_cn="$(ask_endpoint '证书域名 / TLS SNI（自签名可填 hy2.internal，无需购买域名）')"
   [ -n "$cert_cn" ] || die "Hysteria2 必须使用域名证书"
   case "$cert_cn" in *.*) ;; *) die "证书域名格式不正确: ${cert_cn}" ;; esac
   printf '%s\n' "$cert_cn" | grep -Eq '^[0-9.]+$' &&
     die "Hysteria2 证书必须使用域名，不能填 IP 地址。"
-  email="$(ask 'Let''s Encrypt 通知邮箱')"
-  [ -n "$email" ] || die "邮箱不能为空"
-  echo "安装 Certbot 并申请受信任证书；请确保公网 TCP 80 已转发到本机。"
-  apk add --no-cache certbot
-  certbot certonly --standalone --non-interactive --agree-tos \
-    --preferred-challenges http --email "$email" -d "$cert_cn"
-  cert_key="/etc/letsencrypt/live/${cert_cn}/privkey.pem"
-  cert_pem="/etc/letsencrypt/live/${cert_cn}/fullchain.pem"
-  [ -s "$cert_key" ] && [ -s "$cert_pem" ] || die "证书申请成功但文件不存在"
+  printf '%s\n' "$cert_cn" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
+    die "证书域名格式不正确: ${cert_cn}"
+  cert_cn="$(printf '%s' "$cert_cn" | tr '[:upper:]' '[:lower:]')"
+  case "$cert_mode" in
+    1|2)
+      email="$(ask 'Let''s Encrypt 通知邮箱')"
+      [ -n "$email" ] || die "邮箱不能为空"
+      if [ "$cert_mode" = 1 ]; then
+        echo "使用 Cloudflare DNS-01 申请证书，不需要公网 TCP 80/443。"
+        echo "API Token 权限: Zone / DNS / Edit 和 Zone / Zone / Read；资源仅选择该域名所在 Zone。"
+        echo "HY2 连接域名请保持仅 DNS（灰云），并指向 NAT 公网入口；UDP 映射保持不变。"
+        apk add --no-cache certbot certbot-dns-cloudflare
+        cf_credentials="/etc/letsencrypt/cloudflare-${cert_cn}.ini"
+        trusted_path "$cf_credentials" file
+        if [ -s "$cf_credentials" ]; then
+          echo "复用已有 Cloudflare 凭据: $cf_credentials"
+          chmod 600 "$cf_credentials"
+        else
+          cf_token="$(ask_cloudflare_token)"
+          mkdir -p /etc/letsencrypt
+          (umask 077; printf 'dns_cloudflare_api_token = %s\n' "$cf_token" > "$cf_credentials")
+          unset cf_token
+        fi
+        # Replace legacy HTTP renewal settings even when the old certificate is not due.
+        renewal_config="/etc/letsencrypt/renewal/${cert_cn}.conf"
+        set --
+        if [ -f "$renewal_config" ] && ! grep -Eq '^authenticator *= *dns-cloudflare *$' "$renewal_config"; then
+          set -- --force-renewal
+        fi
+        certbot certonly --dns-cloudflare --non-interactive --agree-tos \
+          --dns-cloudflare-credentials "$cf_credentials" \
+          --dns-cloudflare-propagation-seconds 60 --preferred-challenges dns \
+          --cert-name "$cert_cn" --email "$email" -d "$cert_cn" "$@"
+        HY2_AUTO_RENEW=1
+      else
+        echo "手动 DNS 验证：按 Certbot 提示在 DNS 服务商添加 TXT，等待生效后按回车。"
+        echo "此方式不会自动续期；每次续期都需要手动添加新的 TXT 记录。"
+        apk add --no-cache certbot
+        certbot certonly --manual --preferred-challenges dns --agree-tos \
+          --force-renewal --cert-name "$cert_cn" --email "$email" -d "$cert_cn"
+      fi
+      cert_key="/etc/letsencrypt/live/${cert_cn}/privkey.pem"
+      cert_pem="/etc/letsencrypt/live/${cert_cn}/fullchain.pem"
+      [ -s "$cert_key" ] && [ -s "$cert_pem" ] || die "证书申请成功但文件不存在"
+      ;;
+    3|4)
+      cert_dir="${XRAY_DIR}/certs/${NODE_NAME}"
+      trusted_path "$cert_dir" dir
+      mkdir -p "$cert_dir"
+      chmod 700 "$cert_dir"
+      cert_key="$cert_dir/privkey.pem"
+      cert_pem="$cert_dir/fullchain.pem"
+      trusted_path "$cert_key" file
+      trusted_path "$cert_pem" file
+      [ ! -e "$cert_key" ] && [ ! -e "$cert_pem" ] || die "节点证书文件已存在，停止以避免覆盖"
+      if [ "$cert_mode" = 3 ]; then
+        cert_source="$(ask '已有 fullchain PEM 文件的绝对路径')"
+        key_source="$(ask '已有私钥 PEM 文件的绝对路径')"
+        case "$cert_source:$key_source" in /*:/*) ;; *) die "证书和私钥必须使用绝对路径" ;; esac
+        [ -s "$cert_source" ] && [ -s "$key_source" ] || die "证书或私钥文件不存在或为空"
+        openssl x509 -in "$cert_source" -noout -checkend 0 || die "证书无效或已过期"
+        openssl x509 -in "$cert_source" -noout -checkhost "$cert_cn" || die "证书不覆盖所填 SNI"
+        [ "$(openssl x509 -in "$cert_source" -pubkey -noout)" = "$(openssl pkey -in "$key_source" -pubout -passin pass:)" ] ||
+          die "证书与私钥不匹配，或私钥有密码保护"
+        install -m 600 "$cert_source" "$cert_pem"
+        install -m 600 "$key_source" "$cert_key"
+        echo "已复制证书；续期后需更新这些副本并重启 Xray，不会自动同步源文件。"
+      else
+        echo "自签名需要客户端支持 SHA256 证书指纹校验；不支持则请选其他方式。"
+        [ "$(ask '确认客户端支持并将配置指纹？输入 yes 继续' no)" = yes ] || die "已取消自签名证书"
+        (umask 077; openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 \
+          -subj "/CN=${cert_cn}" -addext "subjectAltName=DNS:${cert_cn}" \
+          -keyout "$cert_key" -out "$cert_pem")
+        HY2_CERT_FINGERPRINT="$(openssl x509 -in "$cert_pem" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':')"
+      fi
+      ;;
+  esac
   if [ "$role" = relay ]; then
     echo "上游落地协议: Shadowsocks，aes-128-gcm；请先部署落地节点。"
     ss_address="$(ask_endpoint '落地节点公网 IP/域名')"
@@ -803,7 +894,7 @@ main() {
   CANDIDATE_CONFIG=""
   echo "[5/6] 注册 OpenRC..."
   write_service
-  if [ "$protocol" = 2 ]; then
+  if [ "$protocol" = 2 ] && [ "$HY2_AUTO_RENEW" = 1 ]; then
     write_cert_renewal
   fi
   if ! rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 &&
@@ -829,6 +920,11 @@ main() {
   fi
   echo "导入链接:"
   echo "$LINK"
+  if [ -n "$HY2_CERT_FINGERPRINT" ]; then
+    echo "自签名 SHA256 证书指纹: $HY2_CERT_FINGERPRINT"
+    echo "必须在客户端单独配置此指纹；导入链接不包含指纹，不能只导入链接便连接。"
+    echo "不要仅打开 insecure 跳过验证；不同客户端的指纹设置方式请查其文档。"
+  fi
 }
 
 main "$@"
