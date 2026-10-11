@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Interactive Alpine Xray installer.
+# Interactive Linux Xray installer.
 # Modes:
 #   1 direct  - VLESS+Reality or Hysteria2 -> freedom
 #   2 relay   - relay (VLESS+Reality or Hysteria2 -> SS) or landing (SS -> freedom)
@@ -26,6 +26,56 @@ HY2_CERT_FINGERPRINT=""
 
 die() { echo "错误: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"; }
+
+# Keep platform helpers in both scripts so each remains independently runnable.
+detect_platform() {
+  [ "$(uname -s)" = Linux ] || die "仅支持 Linux。"
+  [ -r /etc/os-release ] || die "缺少 /etc/os-release，无法识别发行版。"
+  . /etc/os-release
+  case "$ID" in
+    alpine) PKG=apk; TIME_SERVICE=chronyd; CRON_SERVICE=crond ;;
+    debian|ubuntu) PKG=apt; TIME_SERVICE=chrony; CRON_SERVICE=cron ;;
+    rocky|almalinux|fedora) PKG=dnf; TIME_SERVICE=chronyd; CRON_SERVICE=crond ;;
+    *) die "不支持的发行版: $ID（支持 Alpine、Debian、Ubuntu、Rocky、AlmaLinux、Fedora）。" ;;
+  esac
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    INIT=systemd
+  elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+    INIT=openrc
+  else
+    die "需要运行中的 systemd 或 OpenRC；不支持无服务管理器的容器。"
+  fi
+}
+install_packages() {
+  case "$PKG" in
+    apk) apk add --no-cache "$@" ;;
+    apt) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    dnf) dnf install -y "$@" ;;
+  esac
+}
+service_action() {
+  if [ "$INIT" = systemd ]; then
+    case "$2" in
+      status) systemctl is-active --quiet "$1" ;;
+      *) systemctl "$2" "$1" ;;
+    esac
+  else
+    rc-service "$1" "$2"
+  fi
+}
+service_enable() {
+  if [ "$INIT" = systemd ]; then systemctl enable "$1"; else rc-update add "$1" default; fi
+}
+ensure_cron() {
+  case "$PKG" in
+    apk) command -v crontab >/dev/null 2>&1 || install_packages busybox ;;
+    apt) install_packages cron ;;
+    dnf) install_packages cronie ;;
+  esac
+  service_enable "$CRON_SERVICE"
+  service_action "$CRON_SERVICE" status >/dev/null 2>&1 || service_action "$CRON_SERVICE" start
+}
+
 trusted_path() {
   local path="$1" kind="${2:-any}" part owner mode child=0
   case "$path" in
@@ -291,10 +341,14 @@ trap cleanup EXIT
 
 install_deps() {
   echo "[1/6] 安装依赖..."
-  command -v apk >/dev/null 2>&1 || die "这不是 Alpine Linux，找不到 apk。"
+  detect_platform
   mkdir -p "$XRAY_DIR"
-  apk add --no-cache ca-certificates wget curl unzip openssl jq libstdc++ libgcc
-  update-ca-certificates
+  case "$PKG" in
+    apk) install_packages ca-certificates wget curl unzip openssl jq libstdc++ libgcc coreutils ;;
+    apt) install_packages ca-certificates wget curl unzip openssl jq libstdc++6 libgcc-s1 coreutils procps ;;
+    dnf) install_packages ca-certificates wget curl unzip openssl jq libstdc++ libgcc coreutils procps-ng ;;
+  esac
+  if command -v update-ca-certificates >/dev/null 2>&1; then update-ca-certificates; else update-ca-trust; fi
   PUBLIC_HOST="$(detect_public_host)"
   if [ -n "$PUBLIC_HOST" ]; then
     echo "探测到公网地址: ${PUBLIC_HOST}"
@@ -304,15 +358,18 @@ install_deps() {
 }
 
 check_system_time() {
-  local drift
+  local drift existing_time=0
+  if pidof ntpd >/dev/null 2>&1 || { [ "$INIT" = systemd ] && systemctl is-active --quiet systemd-timesyncd; }; then
+    existing_time=1
+  fi
   echo "检查系统时间（当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S')）..."
   command -v chronyc >/dev/null 2>&1 && command -v chronyd >/dev/null 2>&1 ||
-    apk add --no-cache chrony
-  if ! pidof chronyd >/dev/null 2>&1 && pidof ntpd >/dev/null 2>&1; then
+    install_packages chrony
+  if [ "$existing_time" = 1 ] && ! pidof chronyd >/dev/null 2>&1; then
     # Do not replace an already running NTP daemon.
     printf '%s\n' 'pool pool.ntp.org iburst' 'pool time.google.com iburst' \
       > "$WORK_DIR/time-probe.conf"
-    echo "已有 ntpd，保留原服务；使用 chronyd 只查询偏差，不修改系统时间。"
+    echo "已有其他校时服务，保留原服务；使用 chronyd 只查询偏差，不修改系统时间。"
     if chronyd -Q -t 25 -f "$WORK_DIR/time-probe.conf" > "$WORK_DIR/time-probe.log" 2>&1; then
       drift="$(awk '/System clock wrong by/ {
         for(i=1;i<=NF;i++) if($i=="by") {print $(i+1); exit}
@@ -325,10 +382,12 @@ check_system_time() {
     fi
     cat "$WORK_DIR/time-probe.log"
   else
-    [ -x /etc/init.d/chronyd ] || apk add --no-cache chrony-openrc
+    if [ "$PKG" = apk ]; then
+      [ -x /etc/init.d/chronyd ] || install_packages chrony-openrc
+    fi
     echo "使用 chronyd 持续校时，等待 NTP 同步（最多约 30 秒）。"
-    rc-update add chronyd default
-    if rc-service chronyd status >/dev/null 2>&1 || rc-service chronyd start; then
+    service_enable "$TIME_SERVICE"
+    if service_action "$TIME_SERVICE" status >/dev/null 2>&1 || service_action "$TIME_SERVICE" start; then
       if chronyc waitsync 15 1 0 2; then
         echo "系统时间已同步，剩余校正不超过 1 秒。"
         chronyc tracking
@@ -426,6 +485,27 @@ download_xray() {
 }
 
 write_service() {
+  if [ "$INIT" = systemd ]; then
+    trusted_path "/etc/systemd/system/${SERVICE_NAME}.service" file
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Xray proxy service
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=${XRAY_BIN} run -config ${XRAY_DIR}/config.json
+Restart=on-failure
+RestartSec=3
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "/etc/systemd/system/${SERVICE_NAME}.service"
+    systemctl daemon-reload
+    service_enable "$SERVICE_NAME"
+    return
+  fi
   trusted_path "/etc/init.d/${SERVICE_NAME}" file
   cat > "/etc/init.d/${SERVICE_NAME}" <<EOF
 #!/sbin/openrc-run
@@ -442,17 +522,35 @@ EOF
 }
 
 write_cert_renewal() {
-  trusted_path /etc/periodic/daily/xray-cert-renew file
-  mkdir -p /etc/periodic/daily
-  cat > /etc/periodic/daily/xray-cert-renew <<EOF
-#!/bin/sh
-certbot renew --quiet --deploy-hook "rc-service ${SERVICE_NAME} restart"
-EOF
-  chmod 700 /etc/periodic/daily/xray-cert-renew
-  if command -v crond >/dev/null 2>&1; then
-    rc-service crond start >/dev/null 2>&1 || true
-    rc-update add crond default >/dev/null 2>&1 || true
+  local renewal restart_command
+  ensure_cron
+  if [ "$INIT" = systemd ]; then
+    restart_command="systemctl restart ${SERVICE_NAME}"
+  else
+    restart_command="rc-service ${SERVICE_NAME} restart"
   fi
+  if [ "$PKG" = apk ]; then renewal=/etc/periodic/daily/xray-cert-renew
+  else renewal=/etc/cron.daily/xray-cert-renew; fi
+  trusted_path "$renewal" file
+  mkdir -p "${renewal%/*}"
+  cat > "$renewal" <<EOF
+#!/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+certbot renew --quiet --deploy-hook "$restart_command"
+EOF
+  chmod 700 "$renewal"
+}
+install_certbot() {
+  if [ "$PKG" = dnf ] && [ "$ID" != fedora ]; then
+    install_packages epel-release
+  fi
+  if [ "${1:-}" = cloudflare ]; then
+    case "$PKG" in
+      apk) install_packages certbot certbot-dns-cloudflare ;;
+      *) install_packages certbot python3-certbot-dns-cloudflare ;;
+    esac
+  else install_packages certbot; fi
 }
 
 make_vless_config() {
@@ -563,7 +661,7 @@ make_hy2_config() {
         echo "使用 Cloudflare DNS-01 申请证书，不需要公网 TCP 80/443。"
         echo "API Token 权限: Zone / DNS / Edit 和 Zone / Zone / Read；资源仅选择该域名所在 Zone。"
         echo "HY2 连接域名请保持仅 DNS（灰云），并指向 NAT 公网入口；UDP 映射保持不变。"
-        apk add --no-cache certbot certbot-dns-cloudflare
+        install_certbot cloudflare
         cf_credentials="/etc/letsencrypt/cloudflare-${cert_cn}.ini"
         trusted_path "$cf_credentials" file
         if [ -s "$cf_credentials" ]; then
@@ -589,7 +687,7 @@ make_hy2_config() {
       else
         echo "手动 DNS 验证：按 Certbot 提示在 DNS 服务商添加 TXT，等待生效后按回车。"
         echo "此方式不会自动续期；每次续期都需要手动添加新的 TXT 记录。"
-        apk add --no-cache certbot
+        install_certbot
         certbot certonly --manual --preferred-challenges dns --agree-tos \
           --force-renewal --cert-name "$cert_cn" --email "$email" -d "$cert_cn"
       fi
@@ -892,16 +990,16 @@ main() {
   fi
   mv "$CANDIDATE_CONFIG" "$XRAY_DIR/config.json"
   CANDIDATE_CONFIG=""
-  echo "[5/6] 注册 OpenRC..."
+  echo "[5/6] 注册 $INIT 服务..."
   write_service
   if [ "$protocol" = 2 ] && [ "$HY2_AUTO_RENEW" = 1 ]; then
     write_cert_renewal
   fi
-  if ! rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 &&
-     ! rc-service "$SERVICE_NAME" start; then
+  if ! service_action "$SERVICE_NAME" restart >/dev/null 2>&1 &&
+     ! service_action "$SERVICE_NAME" start; then
     if [ -n "$PREVIOUS_CONFIG" ]; then
       cp "$PREVIOUS_CONFIG" "$XRAY_DIR/config.json"
-      rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || true
+      service_action "$SERVICE_NAME" restart >/dev/null 2>&1 || true
       die "启动失败，已恢复本次操作前的配置。"
     fi
     die "启动失败，请检查端口占用和服务配置。"

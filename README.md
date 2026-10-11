@@ -1,18 +1,30 @@
-# Alpine Xray 安装器与节点管理器
+# Linux Xray 安装器与节点管理器
 
 仓库只包含两个脚本：
 
 - `xray-installer.sh`：首次安装 Xray，并创建 VLESS+Reality、Hysteria2 或 Shadowsocks 节点。
 - `xray-manager.sh`：按节点名称管理已有入站。
 
-支持 Alpine Linux / OpenRC、NAT 和非 NAT。
+支持 Alpine Linux（OpenRC），以及 Debian、Ubuntu、Rocky Linux、AlmaLinux、Fedora（systemd）；支持 NAT 和非 NAT。需要 root 和运行中的 systemd / OpenRC，不支持 Windows、macOS 或没有服务管理器的精简容器。
+
+脚本根据 `/etc/os-release` 选择 `apk`、`apt-get` 或 `dnf`，未知发行版会停止。Rocky / AlmaLinux 安装 Certbot 时会启用 EPEL；软件包需在当前版本的仓库中可用。系统版本已停止维护或仓库不可用时，应先升级系统或修复仓库。
 
 ## 一键下载运行
 
-在 Alpine 的 root 终端执行。先安装证书和 `wget`，再下载脚本运行。
+在服务器的 root 终端执行。先按发行版安装下载工具：
 
 ```sh
+# Alpine
 apk add --no-cache ca-certificates wget
+# Debian / Ubuntu
+apt-get update && apt-get install -y ca-certificates wget
+# Rocky / AlmaLinux / Fedora
+dnf install -y ca-certificates wget
+```
+
+然后下载并运行安装器：
+
+```sh
 wget -O /root/xray-installer.sh \
   https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-installer.sh
 chmod 700 /root/xray-installer.sh
@@ -22,7 +34,6 @@ sh /root/xray-installer.sh
 管理器：
 
 ```sh
-apk add --no-cache ca-certificates wget
 wget -O /root/xray-manager.sh \
   https://raw.githubusercontent.com/albertyizhan/nat-vpn/main/xray-manager.sh
 chmod 700 /root/xray-manager.sh
@@ -46,7 +57,7 @@ sh /root/xray-manager.sh
 - 客户端公网地址。
 - VLESS Reality SNI：可测试候选并推荐，也可以手动填写。禁止 Cloudflare 域名，默认不是 Microsoft。
 
-节点会注册 OpenRC 开机自启。Hysteria2 使用受信任证书，不打开 `insecure=1`。
+节点会按当前服务管理器注册 systemd 或 OpenRC 开机自启。Hysteria2 使用受信任证书，不打开 `insecure=1`。
 
 ### NAT 下 HY2 为什么需要选择证书方式？
 
@@ -65,7 +76,7 @@ HY2 使用 TLS，需要服务器证书。证书申请和 HY2 流量传输是两�
 
 证书域名的权威 DNS 必须由 Cloudflare 托管。安装时输入 Let's Encrypt 邮箱和 Cloudflare API Token（隐藏输入）：Token 需要 `Zone / DNS / Edit` 和 `Zone / Zone / Read` 权限，资源仅限该域名所在 Zone，不要使用 Global API Key。Certbot 自动创建验证 TXT，等待 DNS 传播 60 秒并完成验证。
 
-Token 保存在服务器 `/etc/letsencrypt/cloudflare-<证书域名>.ini`，权限为 `600`，供自动续期使用；再次安装相同域名时复用凭据。不要公开或删除该文件；Token 失效时需在服务器更新文件内容。每日 `/etc/periodic/daily/xray-cert-renew` 使用 Certbot 保存的 DNS 验证配置，证书成功续期后重启 Xray。旧 HTTP 验证证书重新安装该域名时强制续签一次，以迁移验证方式。避免反复重新签发，以免触发 CA 频率限制。
+Token 保存在服务器 `/etc/letsencrypt/cloudflare-<证书域名>.ini`，权限为 `600`，供自动续期使用；再次安装相同域名时复用凭据。不要公开或删除该文件；Token 失效时需在服务器更新文件内容。每日续期脚本（Alpine 为 `/etc/periodic/daily/xray-cert-renew`，其他支持的发行版为 `/etc/cron.daily/xray-cert-renew`） 使用 Certbot 保存的 DNS 验证配置，证书成功续期后重启 Xray。旧 HTTP 验证证书重新安装该域名时强制续签一次，以迁移验证方式。避免反复重新签发，以免触发 CA 频率限制。
 
 Cloudflare 在这里仅用于 DNS 验证，不中转 HY2 流量。节点连接域名应保持“仅 DNS”（灰云），指向 NAT 公网入口，并配置服务商分配的 UDP 映射端口；DNS 验证本身不要求 A/AAAA 指向安装机器。
 
@@ -129,7 +140,7 @@ rc-service xray restart
 
 统计不是抓包：不能提供逐目标包数量或 HTTPS 完整网址。域名由客户端目标决定，客户端传 IP 时记录 IP，不额外打开嗅探。日志没有自动轮转，需要定期管理磁盘空间。日志默认权限为 `600`，目录为 `700`。
 
-开启统计、日志、月流量限制或非零连接限制后，管理器会安装每分钟运行的采样任务。任务使用 BusyBox `crond`，并注册为 OpenRC 默认服务。不对公网开放 API，统计 API 只绑定本机回环地址。没有任何单独用户、IP 限制或备份菜单。
+开启统计、日志、月流量限制或非零连接限制后，管理器会安装每分钟运行的采样任务。任务使用 root 的 crontab；自动安装或启用对应的 cron 服务（Alpine/RPM 系统为 `crond`，Debian/Ubuntu 为 `cron`）。不对公网开放 API，统计 API 只绑定本机回环地址。没有任何单独用户、IP 限制或备份菜单。
 
 累计统计每分钟保存一次。意外退出、手动重启或掉电前尚未采样的流量可能丢失；统计不能用于要求零误差的账单。已有多凭据节点能按入站统计和启停，但不能自动选出唯一导入链接，管理器不会拆分用户。
 
@@ -145,7 +156,7 @@ rc-service xray restart
 
 `0` 表示无限制。非零值是每分钟检查一次的 TCP 节点软限制：超过上限时停用整个节点，不按 IP 限制，也不会即时拒绝第 N+1 条连接。HY2、UDP、Mux 内部逻辑流和共享端口节点不接受非零限制，避免伪装成 Xray 原生硬并发功能。
 
-连接限制需要 `ss`，缺少时执行 `apk add --no-cache iproute2-ss`。计数针对本机端口的 TCP ESTABLISHED 连接，不代表人数；包含本地连接，也不能区分尚未认证的连接。超限停用后需手动启用，不自动反复重启。
+连接限制需要 `ss`；Alpine 安装 `iproute2-ss`，Debian/Ubuntu 安装 `iproute2`，RPM 系统安装 `iproute`。计数针对本机端口的 TCP ESTABLISHED 连接，不代表人数；包含本地连接，也不能区分尚未认证的连接。超限停用后需手动启用，不自动反复重启。
 
 ## 默认文件
 
@@ -156,3 +167,9 @@ rc-service xray restart
 - 管理器采样副本：`/etc/xray/manager.sh`
 
 --本脚本由gpt-6.1 sol创建，记得多提issues
+
+## 服务操作与网络放行
+
+Alpine 使用 `rc-service xray restart`；systemd 系统使用 `systemctl restart xray`。本文证书更新示例中的 `rc-service` 命令，在 systemd 系统上需按此替换。服务状态分别用 `rc-service xray status` 或 `systemctl status xray` 查看。
+
+脚本不修改系统防火墙、云安全组或 SELinux 策略。请自行放行实际内部监听端口（VLESS/SS 为 TCP，HY2 为 UDP）及服务商的公网映射。RPM 系统如遇权限拒绝，请检查 `journalctl -u xray` 和 SELinux 审计日志，不要直接关闭 SELinux。

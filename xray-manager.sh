@@ -14,6 +14,56 @@ TX=""
 LOCK=""
 
 die() { printf '错误: %s\n' "$*" >&2; exit 1; }
+
+# Keep platform helpers in both scripts so each remains independently runnable.
+detect_platform() {
+  [ "$(uname -s)" = Linux ] || die "仅支持 Linux。"
+  [ -r /etc/os-release ] || die "缺少 /etc/os-release，无法识别发行版。"
+  . /etc/os-release
+  case "$ID" in
+    alpine) PKG=apk; TIME_SERVICE=chronyd; CRON_SERVICE=crond ;;
+    debian|ubuntu) PKG=apt; TIME_SERVICE=chrony; CRON_SERVICE=cron ;;
+    rocky|almalinux|fedora) PKG=dnf; TIME_SERVICE=chronyd; CRON_SERVICE=crond ;;
+    *) die "不支持的发行版: $ID（支持 Alpine、Debian、Ubuntu、Rocky、AlmaLinux、Fedora）。" ;;
+  esac
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    INIT=systemd
+  elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+    INIT=openrc
+  else
+    die "需要运行中的 systemd 或 OpenRC；不支持无服务管理器的容器。"
+  fi
+}
+install_packages() {
+  case "$PKG" in
+    apk) apk add --no-cache "$@" ;;
+    apt) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    dnf) dnf install -y "$@" ;;
+  esac
+}
+service_action() {
+  if [ "$INIT" = systemd ]; then
+    case "$2" in
+      status) systemctl is-active --quiet "$1" ;;
+      *) systemctl "$2" "$1" ;;
+    esac
+  else
+    rc-service "$1" "$2"
+  fi
+}
+service_enable() {
+  if [ "$INIT" = systemd ]; then systemctl enable "$1"; else rc-update add "$1" default; fi
+}
+ensure_cron() {
+  case "$PKG" in
+    apk) command -v crontab >/dev/null 2>&1 || install_packages busybox ;;
+    apt) install_packages cron ;;
+    dnf) install_packages cronie ;;
+  esac
+  service_enable "$CRON_SERVICE"
+  service_action "$CRON_SERVICE" status >/dev/null 2>&1 || service_action "$CRON_SERVICE" start
+}
+
 trusted_path() {
   local path="$1" kind="${2:-any}" part owner mode child=0
   case "$path" in
@@ -92,6 +142,7 @@ trap 'exit 143' TERM
 
 need_tools() {
   [ "$(id -u)" -eq 0 ] || die "请使用 root 运行。"
+  detect_platform
   case "$SERVICE" in
     ''|[!A-Za-z]*|*[!A-Za-z0-9_-]*)
       die "服务名称只能以字母开头，包含字母、数字、下划线或连字符。" ;;
@@ -110,14 +161,14 @@ need_tools() {
     trusted_path "$MENU_RESULT" file
     [ -f "$MENU_RESULT" ] || die "菜单返回文件不存在。"
   fi
-  command -v jq >/dev/null 2>&1 || die "缺少 jq，请执行 apk add --no-cache jq。"
+  command -v jq >/dev/null 2>&1 || die "缺少 jq，请使用系统包管理器安装 jq。"
   [ -x "$XRAY_BIN" ] || die "找不到 Xray: $XRAY_BIN"
   [ -r "$CONFIG" ] || die "找不到配置: $CONFIG"
   jq -e 'type=="object" and (.inbounds | type=="array")' "$CONFIG" >/dev/null ||
     die "配置格式不正确。"
   [ ! -e "$STATE" ] || jq -e 'type=="object" and ((.nodes // {}) | type=="object")' "$STATE" >/dev/null ||
     die "状态文件损坏，未覆盖: $STATE"
-  command -v rc-service >/dev/null 2>&1 || die "需要 Alpine OpenRC 的 rc-service。"
+
 }
 
 # Each action owns the lock; idle menus do not block the sampler.
@@ -246,10 +297,10 @@ apply() {
   mv "$TX/next.json" "$CONFIG"
   save_only
   chmod 600 "$CONFIG" "$STATE"
-  if ! rc-service "$SERVICE" restart; then
+  if ! service_action "$SERVICE" restart; then
     mv "$TX/old-config.json" "$CONFIG"
     mv "$TX/old-state.json" "$STATE"
-    rc-service "$SERVICE" restart >/dev/null 2>&1 || true
+    service_action "$SERVICE" restart >/dev/null 2>&1 || true
     die "重启失败，已恢复本次操作前的配置与状态。"
   fi
 }
@@ -266,8 +317,7 @@ persist_node() {
 }
 
 install_sampler() {
-  command -v crontab >/dev/null 2>&1 || die "缺少 crontab，请安装 BusyBox。"
-  command -v crond >/dev/null 2>&1 || die "缺少 crond，请安装 BusyBox。"
+  ensure_cron
   trusted_path "$RUNNER" file
   if [ "$SELF" != "$RUNNER" ]; then
     cp "$SELF" "$TX/runner.sh"
@@ -278,11 +328,10 @@ install_sampler() {
   state_edit '.sampler=true'
   {
     crontab -l 2>/dev/null | awk '!/# xray-node-manager$/ && !/# xray-node-manager-boot$/'
-    printf "* * * * * XRAY_DIR='%s' CONFIG='%s' STATE='%s' XRAY_BIN='%s' LOG_DIR='%s' SERVICE='%s' '%s' --sample # xray-node-manager\n" \
+    printf "* * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin XRAY_DIR='%s' CONFIG='%s' STATE='%s' XRAY_BIN='%s' LOG_DIR='%s' SERVICE='%s' '%s' --sample # xray-node-manager\n" \
       "$XRAY_DIR" "$CONFIG" "$STATE" "$XRAY_BIN" "$LOG_DIR" "$SERVICE" "$RUNNER"
   } | crontab -
-  rc-update add crond default
-  rc-service crond status >/dev/null 2>&1 || rc-service crond start
+
 }
 
 configure_statistics() {
@@ -382,7 +431,7 @@ set_max_connections() {
   if [ "$value" -gt 0 ]; then
     tcp_limit_supported "$tag"
     port="$(node_value "$tag" '.port')"
-    command -v ss >/dev/null 2>&1 || die "缺少 ss，请执行 apk add --no-cache iproute2-ss。"
+    command -v ss >/dev/null 2>&1 || die "缺少 ss，请安装 iproute2（Alpine: iproute2-ss；RPM 系统: iproute）。"
     ss -Hnt state established "sport = :$port" > "$TX/connections.txt" ||
       die "当前环境无法读取 TCP 连接。"
     echo "每分钟检查本机该端口的 ESTABLISHED TCP 连接；超限会停用整个节点，需手动启用。"
