@@ -117,8 +117,6 @@ sh /root/xray-manager.sh
 - 节点日志：`/etc/xray/logs/<节点名>-connections.log`
 - 管理器采样副本：`/etc/xray/manager.sh`
 
---本脚本由gpt-6.1 sol创建，记得多提issues
-
 ## 服务操作与网络放行
 
 Alpine 使用 `rc-service xray restart`；systemd 系统使用 `systemctl restart xray`。本文证书更新示例中的 `rc-service` 命令，在 systemd 系统上需按此替换。服务状态分别用 `rc-service xray status` 或 `systemctl status xray` 查看。
