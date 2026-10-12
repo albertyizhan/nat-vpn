@@ -18,7 +18,7 @@ CREATION_LOCK=""
 XRAY_VERSION="${XRAY_VERSION:-}"
 PUBLIC_PORT="${PUBLIC_PORT:-}"
 LISTEN_PORT="${LISTEN_PORT:-}"
-SERVER_NAME="${SERVER_NAME:-www.bing.com}"
+SERVER_NAME="${SERVER_NAME:-apps.apple.com}"
 PUBLIC_HOST=""
 NODE_NAME=""
 
@@ -116,9 +116,10 @@ trusted_path() {
   done
 }
 validate_reality_server_name() {
-  case "$SERVER_NAME" in
+  case "$(printf '%s' "$SERVER_NAME" | tr '[:upper:]' '[:lower:]')" in
+    speed.cloudflare.com) ;;
     *[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]*)
-      die "VLESS + Reality 的 SNI 禁止使用 Cloudflare 域名，请改用其他真实 TLS 域名。" ;;
+      die "VLESS + Reality 的 SNI 仅允许 speed.cloudflare.com，其他 Cloudflare 域名禁止使用。" ;;
   esac
   printf '%s\n' "$SERVER_NAME" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]*$' ||
     die "Reality SNI 格式无效。"
@@ -187,7 +188,8 @@ fetch_text() {
 rand_hex() { openssl rand -hex "$1"; }
 rand_password() { openssl rand -base64 24 | tr -d '=+/'; }
 sni_valid() {
-  case "$1" in
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    speed.cloudflare.com) ;;
     *[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]*) return 1 ;;
   esac
   printf '%s\n' "$1" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
@@ -227,13 +229,23 @@ probe_sni() {
 choose_reality_sni() {
   local mode host selected choice recommended index
   command -v timeout >/dev/null 2>&1 || die "缺少 timeout，请安装 BusyBox。"
-  echo "Reality 目标/SNI：默认候选 www.bing.com，不使用 www.microsoft.com 或 Cloudflare。"
-  mode="$(ask '1. 测试候选网站并推荐  2. 手动输入 SNI' 1)"
+  echo "Reality 目标/SNI：默认 $SERVER_NAME；Cloudflare 仅允许 speed.cloudflare.com。"
+  mode="$(ask '1. 使用默认目标  2. 测试候选网站并推荐  3. 手动输入 SNI' 1)"
   case "$mode" in
     1)
+      if sni_valid "$SERVER_NAME" && probe_sni "$SERVER_NAME" > "$WORK_DIR/sni-results.tsv"; then
+        return
+      fi
+      echo "默认目标未通过检查，请选择其他候选。"
+      ;;
+    2|3) ;;
+    *) die "SNI 模式只能是 1、2 或 3。" ;;
+  esac
+  case "$mode" in
+    1|2)
       : > "$WORK_DIR/sni-results.tsv"
       # These are candidates, not a permanent compatibility allowlist.
-      for host in www.bing.com www.amazon.com www.yahoo.com www.samsung.com www.nvidia.com; do
+      for host in apps.apple.com speed.cloudflare.com www.bing.com www.amazon.com www.yahoo.com www.samsung.com www.nvidia.com; do
         probe_sni "$host" >> "$WORK_DIR/sni-results.tsv" || true
       done
       sort -n "$WORK_DIR/sni-results.tsv" > "$WORK_DIR/sni-ranked.tsv"
@@ -258,13 +270,12 @@ choose_reality_sni() {
         echo "没有候选通过检查，请手动输入并测试。"
       fi
       ;;
-    2) ;;
-    *) die "SNI 模式只能是 1 或 2。" ;;
+    3) ;;
   esac
   while :; do
     host="$(ask '自定义 SNI 域名（目标同为此域名:443）' "$SERVER_NAME")"
     if ! sni_valid "$host"; then
-      echo "请输入有效域名，不能使用 IP、通配符或 Cloudflare 域名。"
+      echo "请输入有效域名，不能使用 IP、通配符；Cloudflare 仅允许 speed.cloudflare.com。"
       continue
     fi
     if probe_sni "$host" > "$WORK_DIR/sni-results.tsv"; then
@@ -312,6 +323,8 @@ cleanup() {
     rm -f "$WORK_DIR/sni-probe.txt"
     rm -f "$WORK_DIR/sni-results.tsv"
     rm -f "$WORK_DIR/sni-ranked.tsv"
+    rm -f "$WORK_DIR/filter-state.json"
+    rm -f "$WORK_DIR/filtered-config.json"
     rm -f "$WORK_DIR/public-ip"
     rmdir "$WORK_DIR" 2>/dev/null || true
   fi
@@ -683,6 +696,45 @@ merge_node_config() {
   ' "$existing" > "$candidate"
 }
 
+# Rebuild private fallback listeners and exact-SNI routes from active REALITY nodes.
+sync_reality_filters() {
+  local config="$1" state="$2" output="$3"
+  jq --slurpfile state "$state" '
+    def owned: startswith("reality-filter-");
+    .inbounds = [(.inbounds // [])[] | select(((.tag // "") | owned) | not)] |
+    .outbounds = [(.outbounds // [])[] | select(((.tag // "") | owned) | not)] |
+    .routing.rules = [(.routing.rules // [])[] |
+      select((any(.inboundTag[]?; owned) or ((.outboundTag // "") | owned)) | not)] |
+    ([.inbounds[].port, $state[0].nodes[]?.inbound.port] | map(select(. != null))) as $reserved |
+    if any($reserved[]; type != "number") then error("Cannot allocate fallback port with port ranges") else . end |
+    [.inbounds[] | select(.protocol=="vless" and .streamSettings.security=="reality" and
+      ((.tag // "") | test("^[A-Za-z][A-Za-z0-9]*$")))] as $nodes |
+    reduce $nodes[] as $node ({config:., used:$reserved};
+      ([range(20000;65536)] - .used | .[0]) as $port |
+      if $port==null then error("No free fallback port") else . end |
+      ("reality-filter-"+$node.tag) as $tag |
+      ($node.streamSettings.realitySettings.serverNames) as $names |
+      if ($names | type)!="array" or ($names | length)==0 or any($names[]; .=="")
+      then error("REALITY requires nonempty serverNames") else . end |
+      .used += [$port] |
+      .config.inbounds |= map(if .tag==$node.tag then
+        .streamSettings.realitySettings.dest=("127.0.0.1:"+($port|tostring)) |
+        del(.streamSettings.realitySettings.target) else . end) |
+      .config.inbounds += [{tag:$tag,listen:"127.0.0.1",port:$port,protocol:"dokodemo-door",
+        settings:{address:$names[0],port:443,network:"tcp"},
+        sniffing:{enabled:true,destOverride:["tls"],routeOnly:true}}] |
+      .config.routing.rules = [
+        {type:"field",inboundTag:[$tag],domain:($names|map("full:"+.)),outboundTag:"reality-filter-direct"},
+        {type:"field",inboundTag:[$tag],outboundTag:"reality-filter-block"}
+      ] + .config.routing.rules
+    ) | .config |
+    if ($nodes|length)>0 then .outbounds += [
+      {tag:"reality-filter-direct",protocol:"freedom"},
+      {tag:"reality-filter-block",protocol:"blackhole"}
+    ] else . end
+  ' "$config" > "$output"
+}
+
 stage_node_config() {
   CANDIDATE_CONFIG="$(mktemp "$XRAY_DIR/.config-candidate.XXXXXX")"
   if [ -e "$XRAY_DIR/config.json" ]; then
@@ -706,9 +758,9 @@ stage_node_state() {
     printf '{"nodes":{}}\n' > "$CANDIDATE_STATE"
   fi
   jq --arg name "$NODE_NAME" --arg host "$CLIENT_HOST" --argjson port "$PUBLIC_PORT" \
-    --arg sni "$SERVER_NAME" --slurpfile node "$GENERATED_CONFIG" '
+    --arg sni "$SERVER_NAME" --slurpfile node "$CANDIDATE_CONFIG" '
     .nodes = (.nodes // {}) |
-    .nodes[$name] = {inbound:$node[0].inbounds[0], disabled:false,
+    .nodes[$name] = {inbound:($node[0].inbounds[] | select(.tag==$name)), disabled:false,
       public_host:$host, public_port:$port, sni:$sni, max_connections:0}
   ' "$CANDIDATE_STATE" > "$WORK_DIR/node-state.json"
   mv "$WORK_DIR/node-state.json" "$CANDIDATE_STATE"
@@ -800,6 +852,13 @@ main() {
   esac
   echo "[4/6] 检查配置..."
   stage_node_config
+  if [ -e "$XRAY_DIR/manager-state.json" ]; then
+    cp "$XRAY_DIR/manager-state.json" "$WORK_DIR/filter-state.json"
+  else
+    printf '{"nodes":{}}\n' > "$WORK_DIR/filter-state.json"
+  fi
+  sync_reality_filters "$CANDIDATE_CONFIG" "$WORK_DIR/filter-state.json" "$WORK_DIR/filtered-config.json"
+  mv "$WORK_DIR/filtered-config.json" "$CANDIDATE_CONFIG"
   "$XRAY_BIN" run -test -format json -config "$CANDIDATE_CONFIG"
   stage_node_state
   if [ -e "$XRAY_DIR/config.json" ]; then

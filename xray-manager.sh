@@ -115,7 +115,10 @@ valid_number() {
 }
 valid_port() { valid_number "$1" && [ "$1" -gt 0 ] && [ "$1" -le 65535 ]; }
 valid_sni() {
-  case "$1" in *[Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]*) return 1 ;; esac
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    speed.cloudflare.com) ;;
+    *cloudflare*) return 1 ;;
+  esac
   printf '%s\n' "$1" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
 }
 uri() { jq -rn --arg v "$1" '$v | @uri'; }
@@ -289,7 +292,52 @@ save_only() {
   chmod 600 "$STATE"
 }
 
+# Rebuild private fallback listeners and exact-SNI routes from active REALITY nodes.
+sync_reality_filters() {
+  local config="$1" state="$2" output="$3"
+  jq --slurpfile state "$state" '
+    def owned: startswith("reality-filter-");
+    .inbounds = [(.inbounds // [])[] | select(((.tag // "") | owned) | not)] |
+    .outbounds = [(.outbounds // [])[] | select(((.tag // "") | owned) | not)] |
+    .routing.rules = [(.routing.rules // [])[] |
+      select((any(.inboundTag[]?; owned) or ((.outboundTag // "") | owned)) | not)] |
+    ([.inbounds[].port, $state[0].nodes[]?.inbound.port] | map(select(. != null))) as $reserved |
+    if any($reserved[]; type != "number") then error("Cannot allocate fallback port with port ranges") else . end |
+    [.inbounds[] | select(.protocol=="vless" and .streamSettings.security=="reality" and
+      ((.tag // "") | test("^[A-Za-z][A-Za-z0-9]*$")))] as $nodes |
+    reduce $nodes[] as $node ({config:., used:$reserved};
+      ([range(20000;65536)] - .used | .[0]) as $port |
+      if $port==null then error("No free fallback port") else . end |
+      ("reality-filter-"+$node.tag) as $tag |
+      ($node.streamSettings.realitySettings.serverNames) as $names |
+      if ($names | type)!="array" or ($names | length)==0 or any($names[]; .=="")
+      then error("REALITY requires nonempty serverNames") else . end |
+      .used += [$port] |
+      .config.inbounds |= map(if .tag==$node.tag then
+        .streamSettings.realitySettings.dest=("127.0.0.1:"+($port|tostring)) |
+        del(.streamSettings.realitySettings.target) else . end) |
+      .config.inbounds += [{tag:$tag,listen:"127.0.0.1",port:$port,protocol:"dokodemo-door",
+        settings:{address:$names[0],port:443,network:"tcp"},
+        sniffing:{enabled:true,destOverride:["tls"],routeOnly:true}}] |
+      .config.routing.rules = [
+        {type:"field",inboundTag:[$tag],domain:($names|map("full:"+.)),outboundTag:"reality-filter-direct"},
+        {type:"field",inboundTag:[$tag],outboundTag:"reality-filter-block"}
+      ] + .config.routing.rules
+    ) | .config |
+    if ($nodes|length)>0 then .outbounds += [
+      {tag:"reality-filter-direct",protocol:"freedom"},
+      {tag:"reality-filter-block",protocol:"blackhole"}
+    ] else . end
+  ' "$config" > "$output"
+}
+
 apply() {
+  sync_reality_filters "$TX/config.json" "$TX/state.json" "$TX/next.json"
+  mv "$TX/next.json" "$TX/config.json"
+  state_edit '
+    reduce $config[0].inbounds[] as $i (. ;
+      if .nodes[$i.tag]!=null then .nodes[$i.tag].inbound=$i else . end)
+  ' --slurpfile config "$TX/config.json"
   "$XRAY_BIN" run -test -format json -config "$TX/config.json" ||
     die "配置检查失败，未应用。"
   state_edit '.nodes |= with_entries(.value.epoch="" | .value.last_up=0 | .value.last_down=0)'
@@ -720,7 +768,7 @@ edit_config() {
       ;;
     4)
       proto="$(node_value "$tag" '.protocol')"
-      value="$(ask "新的 SNI")"; valid_sni "$value" || die "域名无效，禁止 Cloudflare。"
+      value="$(ask "新的 SNI")"; valid_sni "$value" || die "域名无效；Cloudflare 仅允许 speed.cloudflare.com。"
       case "$proto" in
         vless)
           [ "$(node_value "$tag" '.streamSettings.security')" = reality ] || die "不是 Reality 节点。"

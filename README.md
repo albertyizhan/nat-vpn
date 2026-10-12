@@ -55,13 +55,13 @@ sh /root/xray-manager.sh
 - VLESS+Reality 或落地 Shadowsocks。
 - NAT 时填写内部监听端口和外部映射端口；非 NAT 时两者相同。
 - 客户端公网地址。
-- VLESS Reality SNI：可测试候选并推荐，也可以手动填写。禁止 Cloudflare 域名，默认不是 Microsoft。
+- VLESS Reality SNI：默认使用 `apps.apple.com`，也可测试候选并推荐或手动填写。默认目标仍需通过兼容性检查，失败后转入候选测试。Cloudflare 仅允许 `speed.cloudflare.com`。
 
 节点会按当前服务管理器注册 systemd 或 OpenRC 开机自启。
 
 安装器在第一阶段、安装其余依赖和探测公网地址之前检查系统时间：优先复用正在运行的 systemd-timesyncd 或 ntpd，不为它们安装或替换 chrony。timesyncd 等待系统同步标志；ntpd 使用已有的 ntpq 检查选中的同步源及偏差，缺少 ntpq 时无法自动确认。没有这些服务时，复用已有 chrony，或先通过系统包管理器安装 chrony，再启动并等待同步。未确认同步时默认停止，只有明确确认才继续；chrony 需要立即跳变校时时另行询问。若错误时间导致包仓库 HTTPS 失败，先从宿主机或控制台校正时间，再重试，脚本不会关闭 TLS 证书校验。NAT 需允许出站 UDP 123，不能修改系统时钟的容器需由宿主机校时。客户端时间也需要准确，改变时区不等于校时。
 
-默认内部端口：VLESS TCP `443`、Shadowsocks TCP `8388`。Reality 默认候选为 `www.bing.com`；候选测试也包含 Amazon、Yahoo、Samsung、NVIDIA。NAT 映射必须由服务商或路由器配置，脚本不会替你建立映射。同协议可以创建多个节点，但名称和内部端口不能冲突，包括已停用的节点。
+默认内部端口：VLESS TCP `443`、Shadowsocks TCP `8388`。Reality 默认目标为 `apps.apple.com`；候选测试包含 `apps.apple.com`、`speed.cloudflare.com`、Bing、Amazon、Yahoo、Samsung、NVIDIA，按通过检查的 TLS 建连时间排序（不代表端到端代理速度）。NAT 映射必须由服务商或路由器配置，脚本不会替你建立映射。同协议可以创建多个节点，但名称和内部端口不能冲突，包括已停用的节点。
 
 ## 节点管理器
 
@@ -130,3 +130,11 @@ Alpine 使用 `rc-service xray restart`；systemd 系统使用 `systemctl restar
 安装器与管理器现在只支持 VLESS + Reality 和 Shadowsocks，不再创建或提供 HY2 专用编辑、链接导出与证书申请流程。直连和中转入站固定使用 VLESS + Reality，落地节点使用 Shadowsocks。
 
 更新脚本不会自动删除服务器已有的 HY2 入站、管理状态、证书、Cloudflare API 凭据或旧续期任务；原有配置会被保留，但 HY2 不再显示在管理菜单中。需要停用旧 HY2 时，请先备份并手动处理该入站及关联路由，不要直接删除整个 Xray 配置，以免影响 VLESS。旧证书续期任务也需按实际使用情况手动处理。
+
+### Reality 回落防盗用
+
+安装或管理器应用配置时，会为受管理的 Reality 节点生成仅监听 `127.0.0.1` 的独立 `dokodemo-door` 回落入口，Reality 的 `dest` 指向该入口。TLS 嗅探使用 `routeOnly: true`，真实目标固定为该节点的首个 SNI 域名的 443 端口。路由使用 `full:` 精确匹配 `serverNames`，允许的回落走独立直连出口，其他回落进入 `blackhole`，不会进入中转 SS 出口。
+
+本地过滤端口自动从 20000–65535 分配，避开配置中已有端口及停用节点保留的端口；不需要公网或 NAT 映射。启停、删除、改名和修改 SNI 时同步重建过滤配置。包含端口范围的配置会停止自动分配；运行时端口占用由 Xray 启动检查发现，启动失败沿用现有回滚流程。请勿手动使用 `reality-filter-` 标签前缀，它保留给过滤配置使用。
+
+此措施阻止借共享 CDN 回落访问其他域名，不会消除访问允许目标本身的流量，也不是全局限速或 DDoS 防护。现有节点需更新管理脚本并执行一次应用配置的操作（例如修改 SNI）才会生效；仅替换脚本不会立即修改正在运行的服务。
