@@ -180,7 +180,11 @@ ask() {
   else
     printf "%s: " "$prompt" >&2
   fi
-  IFS= read -r answer
+  if ! IFS= read -r answer; then
+    # ask() is commonly executed in $(...), so signal the parent shell too.
+    [ "${PPID:-}" -gt 1 ] 2>/dev/null && kill -TERM "$PPID" 2>/dev/null || true
+    exit 143
+  fi
   printf "%s" "${answer:-$default}"
 }
 ask_port() {
@@ -382,6 +386,10 @@ cleanup() {
   [ -z "$CREATION_LOCK" ] || rmdir "$CREATION_LOCK" 2>/dev/null || true
 }
 trap cleanup EXIT
+# Convert interrupts into a normal shell exit so the EXIT cleanup removes the
+# transaction files and lock directory even while waiting for interactive input.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 install_deps() {
   echo "[1/6] 准备校时与基础依赖..."

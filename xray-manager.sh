@@ -105,7 +105,16 @@ trusted_path() {
     [ -n "$part" ] || part=/
   done
 }
-ask() { printf '%s: ' "$1" >&2; IFS= read -r answer || exit 1; printf '%s' "$answer"; }
+# Reads happen in command substitutions; propagate EOF to the main shell so its
+# EXIT trap releases the transaction lock instead of leaving the menu running.
+ask() {
+  printf '%s: ' "$1" >&2
+  if ! IFS= read -r answer; then
+    [ "${PPID:-}" -gt 1 ] 2>/dev/null && kill -TERM "$PPID" 2>/dev/null || true
+    exit 143
+  fi
+  printf '%s' "$answer"
+}
 confirm() { case "$(ask "$1 [y/N]")" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
 valid_name() { printf '%s\n' "$1" | grep -Eq '^[A-Za-z][A-Za-z0-9]*$'; }
 valid_host() { printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.:-]*$'; }
