@@ -412,6 +412,16 @@ install_deps() {
 
 check_system_time() {
   local attempt peers
+  # Container capabilities may only apply inside a user namespace, not to the host clock.
+  if [ -e /.dockerenv ] || [ -e /run/.containerenv ] ||
+     { [ -d /proc/vz ] && [ ! -d /proc/bc ]; } ||
+     { command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet; } ||
+     { [ -r /proc/1/environ ] && tr '\000' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container=.'; } ||
+     { [ -r /proc/self/uid_map ] && awk '
+         NF==3 {rows++; if ($1!=0 || $2!=0 || $3!=4294967295) remapped=1}
+         END {exit !(rows>0 && remapped)}' /proc/self/uid_map; }; then
+    return 0
+  fi
   # CAP_SYS_TIME is bit 25; inspect its hex digit without 64-bit arithmetic.
   if [ -r /proc/self/status ] && awk '
     /^CapEff:/ {
