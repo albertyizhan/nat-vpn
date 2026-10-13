@@ -392,7 +392,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 install_deps() {
-  echo "[1/6] 准备校时与基础依赖..."
+  echo "[1/6] 准备基础依赖..."
   detect_platform
   check_system_time
   mkdir -p "$XRAY_DIR"
@@ -412,7 +412,6 @@ install_deps() {
 
 check_system_time() {
   local attempt peers
-  echo "检查系统时间（当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S')）..."
   # CAP_SYS_TIME is bit 25; inspect its hex digit without 64-bit arithmetic.
   if [ -r /proc/self/status ] && awk '
     /^CapEff:/ {
@@ -421,9 +420,9 @@ check_system_time() {
       if (value>=0 && int(value/2)%2==0) missing=1
     }
     END {exit !missing}' /proc/self/status; then
-    echo "当前环境无校时权限，时间由宿主机管理；跳过校时并继续安装（未验证同步状态）。"
     return 0
   fi
+  echo "检查系统时间（当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S')）..."
   if [ "$INIT" = systemd ] && systemctl is-active --quiet systemd-timesyncd; then
     echo "复用 systemd-timesyncd，等待同步（最多约 30 秒）。"
     attempt=0
