@@ -74,6 +74,54 @@ ensure_cron() {
   service_action "$CRON_SERVICE" status >/dev/null 2>&1 || service_action "$CRON_SERVICE" start
 }
 
+enable_bbr() {
+  local available old_qdisc old_cc
+  echo "检测 BBR 支持..."
+  if ! command -v sysctl >/dev/null 2>&1; then
+    echo "警告: 缺少 sysctl，跳过 BBR。" >&2
+    return 0
+  fi
+  # A supported module may not yet be loaded, so try it before checking.
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe tcp_bbr >/dev/null 2>&1 || :
+  fi
+  available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)" || available=""
+  case " $available " in
+    *" bbr "*) ;;
+    *) echo "警告: 当前内核不提供 BBR，跳过；不会自动更换内核。" >&2; return 0 ;;
+  esac
+  old_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null)" || old_qdisc=""
+  old_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" || old_cc=""
+  if [ -n "$old_qdisc" ]; then
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 ||
+      echo "警告: 无法设置 fq，继续尝试开启 BBR。" >&2
+  else
+    echo "提示: 当前环境未暴露 default_qdisc，跳过 fq 设置。"
+  fi
+  if ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 ||
+     [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != bbr ]; then
+    [ -z "$old_qdisc" ] || sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || :
+    [ -z "$old_cc" ] || sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || :
+    echo "警告: 无法开启 BBR（容器可能需要宿主机配置），未写入持久化配置。" >&2
+    return 0
+  fi
+  trusted_path /etc/sysctl.d dir
+  trusted_path /etc/sysctl.d/99-xray-bbr.conf file
+  if ! mkdir -p /etc/sysctl.d || ! (
+    umask 022
+    {
+      if [ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = fq ]; then
+        printf '%s\n' 'net.core.default_qdisc = fq'
+      fi
+      printf '%s\n' 'net.ipv4.tcp_congestion_control = bbr'
+    } > /etc/sysctl.d/99-xray-bbr.conf
+  ); then
+    echo "警告: BBR 已开启，但持久化配置写入失败。" >&2
+    return 0
+  fi
+  echo "BBR 已开启并验证，持久化配置: /etc/sysctl.d/99-xray-bbr.conf"
+}
+
 trusted_path() {
   local path="$1" kind="${2:-any}" part owner mode child=0
   case "$path" in
@@ -781,6 +829,7 @@ main() {
   WORK_DIR="$(mktemp -d /tmp/xray-installer.XXXXXX)"
   GENERATED_CONFIG="$WORK_DIR/node.json"
   install_deps
+  enable_bbr
   if [ -e "$XRAY_DIR/manager-state.json" ]; then
     jq -e 'type=="object" and ((.nodes // {}) | type=="object")' "$XRAY_DIR/manager-state.json" >/dev/null ||
       die "管理器状态文件损坏，未覆盖。请检查 $XRAY_DIR/manager-state.json"
