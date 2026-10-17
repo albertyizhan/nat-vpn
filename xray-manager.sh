@@ -115,7 +115,10 @@ ask() {
   fi
   printf '%s' "$answer"
 }
-confirm() { case "$(ask "$1 [y/N]")" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
+confirm() { case "$(ask "$1 [y/N]")" in y|Y|yes|YES) return 0 ;; *) echo "已取消。"; return 1 ;; esac; }
+# Empty input cancels an edit; zero remains a valid value for limits.
+edit_value() { ask "$1；留空取消"; }
+has_value() { [ -n "$1" ] || { echo "已取消。"; return 1; }; }
 valid_name() { printf '%s\n' "$1" | grep -Eq '^[A-Za-z][A-Za-z0-9]*$'; }
 valid_host() { printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.:-]*$'; }
 valid_number() {
@@ -340,6 +343,19 @@ sync_reality_filters() {
   ' "$config" > "$output"
 }
 
+service_diagnostics() {
+  echo "服务诊断（最近记录）:" >&2
+  if [ "$INIT" = systemd ]; then
+    systemctl status "$SERVICE" --no-pager --full >&2 || true
+    journalctl -u "$SERVICE" -n 20 --no-pager >&2 || true
+    echo "继续排查: journalctl -u $SERVICE -n 50 --no-pager" >&2
+  else
+    rc-service "$SERVICE" status >&2 || true
+    echo "继续排查: rc-service $SERVICE status；检查 /etc/init.d/$SERVICE 中配置的日志路径。" >&2
+  fi
+  echo "检查监听端口: ss -lntp；检查配置: $XRAY_BIN run -test -format json -config $CONFIG" >&2
+}
+
 apply() {
   sync_reality_filters "$TX/config.json" "$TX/state.json" "$TX/next.json"
   mv "$TX/next.json" "$TX/config.json"
@@ -354,12 +370,19 @@ apply() {
   mv "$TX/next.json" "$CONFIG"
   save_only
   chmod 600 "$CONFIG" "$STATE"
-  if ! service_action "$SERVICE" restart; then
+  echo "正在重启 Xray；同一进程中所有节点的现有连接会中断。"
+  if ! service_action "$SERVICE" restart || ! service_action "$SERVICE" status >/dev/null 2>&1; then
+    echo "新配置启动失败，正在恢复原配置与状态。" >&2
+    service_diagnostics
     mv "$TX/old-config.json" "$CONFIG"
     mv "$TX/old-state.json" "$STATE"
-    service_action "$SERVICE" restart >/dev/null 2>&1 || true
-    die "重启失败，已恢复本次操作前的配置与状态。"
+    if service_action "$SERVICE" restart && service_action "$SERVICE" status >/dev/null 2>&1; then
+      die "本次修改未生效；原配置与状态已恢复，Xray 服务已恢复运行。"
+    fi
+    service_diagnostics
+    die "原配置与状态已恢复，但 Xray 服务仍未恢复运行，请按上方提示排查。"
   fi
+  echo "配置已应用，Xray 服务正在运行。"
 }
 
 persist_node() {
@@ -483,7 +506,8 @@ tcp_limit_supported() {
 set_max_connections() {
   local tag value port
   tag="$1"
-  value="$(ask "最大连接数，0=无限制；当前 $(state_value "$tag" '.max_connections // 0')")"
+  value="$(edit_value "最大连接数，0=无限制；当前 $(state_value "$tag" '.max_connections // 0')")"
+  has_value "$value" || return 0
   valid_number "$value" || die "请输入非负整数（不要加前导零）。"
   if [ "$value" -gt 0 ]; then
     tcp_limit_supported "$tag"
@@ -542,7 +566,8 @@ quota_exhausted() {
 set_monthly_quota() {
   local tag quota day period previous_day
   tag="$1"
-  quota="$(ask "月流量上限 GiB，0=不限；当前 $(state_value "$tag" '.quota_gib // 0')")"
+  quota="$(edit_value "月流量上限 GiB，0=不限；当前 $(state_value "$tag" '.quota_gib // 0')")"
+  has_value "$quota" || return 0
   valid_number "$quota" || die "请输入非负整数 GiB（不要加前导零）。"
   if [ "$quota" -eq 0 ]; then
     state_edit '.nodes[$tag].quota_gib=0 |
@@ -552,7 +577,8 @@ set_monthly_quota() {
     echo "月流量限制已取消。"
     return
   fi
-  day="$(ask "每月重置日 1–31，UTC 00:00；短月份取月末；当前 $(state_value "$tag" '.reset_day // 1')")"
+  day="$(edit_value "每月重置日 1–31，UTC 00:00；短月份取月末；当前 $(state_value "$tag" '.reset_day // 1')")"
+  has_value "$day" || return 0
   valid_number "$day" && [ "$day" -ge 1 ] && [ "$day" -le 31 ] || die "重置日必须为 1–31。"
   period="$(quota_period "$day")"
   previous_day="$(state_value "$tag" '.reset_day // 1')"
@@ -627,11 +653,13 @@ show_link() {
   host="$(state_value "$tag" '.public_host // ""')"
   port="$(state_value "$tag" '.public_port // ""')"
   if [ -z "$host" ]; then
-    host="$(ask "客户端公网地址（域名/IP）")"
+    host="$(edit_value "客户端公网地址（域名/IP）")"
+    has_value "$host" || return 0
     valid_host "$host" || die "地址格式无效。"
   fi
   if [ -z "$port" ]; then
-    port="$(ask "外部访问端口（NAT 填外部映射，不猜测内部端口）")"
+    port="$(edit_value "外部访问端口（NAT 填外部映射，不猜测内部端口）")"
+    has_value "$port" || return 0
     valid_port "$port" || die "端口无效。"
   fi
   state_edit '.nodes[$tag].public_host=$host | .nodes[$tag].public_port=$port' \
@@ -680,14 +708,15 @@ set_enabled() {
     (if $disabled then "manual" else null end)' --arg tag "$tag" --argjson disabled "$disabled"
   persist_node "$tag"
   apply
-  echo "节点状态已更新；重载服务会中断此 Xray 进程的现有连接。"
+  if [ "$disabled" = true ]; then echo "节点 $tag 已停用。"; else echo "节点 $tag 已启用。"; fi
 }
 
 rename_node() {
   local tag new
-  tag="$1"; new="$(ask "新名称（英文字母开头，后续仅字母和数字）")"
+  tag="$1"; new="$(edit_value "新名称（英文字母开头，后续仅字母和数字）")"
+  has_value "$new" || return 0
   valid_name "$new" || die "名称无效。"
-  [ "$new" != "$tag" ] || return 0
+  [ "$new" != "$tag" ] || { echo "名称未改变。"; return 0; }
   trusted_path "$LOG_DIR/$tag-connections.log" file
   trusted_path "$LOG_DIR/$new-connections.log" file
   [ ! -e "$LOG_DIR/$new-connections.log" ] || die "新名称日志已存在，请先处理: $LOG_DIR/$new-connections.log"
@@ -741,8 +770,9 @@ delete_node() {
 }
 
 edit_config() {
-  local tag value proto cert host port password
+  local tag value proto host port password
   tag="$1"
+  node_summary "$tag" "$TX/state.json" "$TX/config.json"
   echo "1. 内部监听端口"
   echo "2. 外部访问/映射端口"
   echo "3. 客户端公网地址"
@@ -753,7 +783,8 @@ edit_config() {
   echo "0. 返回"
   case "$(ask "选择配置项目")" in
     1)
-      value="$(ask "新的内部端口（当前 $(node_value "$tag" '.port')）")"
+      value="$(edit_value "新的内部端口（当前 $(node_value "$tag" '.port')）")"
+      has_value "$value" || return 0
       valid_port "$value" || die "端口无效。"
       jq -e --arg tag "$tag" --argjson port "$value" '
         any(.nodes | to_entries[]; .key!=$tag and .value.inbound.port==$port)
@@ -767,17 +798,24 @@ edit_config() {
       echo "内部端口已修改，外部映射未改变；请同步服务商 NAT 映射。"
       ;;
     2)
-      value="$(ask "新的外部端口（当前 $(state_value "$tag" '.public_port // "未设置"')）")"
+      value="$(edit_value "新的外部端口（当前 $(state_value "$tag" '.public_port // "未设置"')）")"
+      has_value "$value" || return 0
       valid_port "$value" || die "端口无效。"
       state_edit '.nodes[$tag].public_port=$value' --arg tag "$tag" --argjson value "$value"; save_only
+      echo "外部端口已更新为 $value，请重新显示导入链接。"
       ;;
     3)
-      value="$(ask "新的客户端公网地址")"; valid_host "$value" || die "地址无效。"
+      value="$(edit_value "新的客户端公网地址（当前 $(state_value "$tag" '.public_host // "未设置"')）")"
+      has_value "$value" || return 0
+      valid_host "$value" || die "地址无效。"
       state_edit '.nodes[$tag].public_host=$value' --arg tag "$tag" --arg value "$value"; save_only
+      echo "客户端公网地址已更新为 $value，请重新显示导入链接。"
       ;;
     4)
       proto="$(node_value "$tag" '.protocol')"
-      value="$(ask "新的 SNI")"; valid_sni "$value" || die "域名无效；Cloudflare 仅允许 speed.cloudflare.com。"
+      value="$(edit_value "新的 SNI（当前 $(node_value "$tag" '.streamSettings.realitySettings.serverNames[0] // "不适用"')）")"
+      has_value "$value" || return 0
+      valid_sni "$value" || die "域名无效；Cloudflare 仅允许 speed.cloudflare.com。"
       case "$proto" in
         vless)
           [ "$(node_value "$tag" '.streamSettings.security')" = reality ] || die "不是 Reality 节点。"
@@ -791,8 +829,8 @@ edit_config() {
       esac
       ;;
     5)
-      value="$(ask "输入新 UUID/密码（更改后旧链接失效）")"
-      [ -n "$value" ] || die "不能为空。"
+      value="$(edit_value "输入新 UUID/密码（更改后旧链接失效）")"
+      has_value "$value" || return 0
       case "$(node_value "$tag" '.protocol')" in
         vless)
           printf '%s\n' "$value" | grep -Eq '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$' || die "UUID 格式无效。"
@@ -804,18 +842,25 @@ edit_config() {
 
       esac
       persist_node "$tag"; apply
+      echo "节点凭据已更新，旧链接失效，请重新显示导入链接。"
       ;;
     6) rename_node "$tag" ;;
     7)
       jq -e --arg tag "$tag" 'any(.outbounds[]?; .tag==($tag+"Out") and .protocol=="shadowsocks")' "$TX/config.json" >/dev/null ||
         die "没有此节点专属的 SS 中转出口。"
-      host="$(ask "落地公网地址")"; valid_host "$host" || die "地址无效。"
-      port="$(ask "落地外部 SS 端口")"; valid_port "$port" || die "端口无效。"
-      password="$(ask "落地 SS 密码")"; [ -n "$password" ] || die "密码不能为空。"
+      host="$(edit_value "落地公网地址（当前 $(jq -r --arg tag "$tag" '.outbounds[] | select(.tag==($tag+"Out")) | .settings.servers[0].address' "$TX/config.json")）")"
+      has_value "$host" || return 0
+      valid_host "$host" || die "地址无效。"
+      port="$(edit_value "落地外部 SS 端口（当前 $(jq -r --arg tag "$tag" '.outbounds[] | select(.tag==($tag+"Out")) | .settings.servers[0].port' "$TX/config.json")）")"
+      has_value "$port" || return 0
+      valid_port "$port" || die "端口无效。"
+      password="$(edit_value "落地 SS 密码")"
+      has_value "$password" || return 0
       config_edit '.outbounds |= map(if .tag==($tag+"Out") then
         .settings.servers[0] |= (.address=$host | .port=$port | .password=$password) else . end)' \
         --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg password "$password"
       apply
+      echo "中转 SS 出口已更新。"
       ;;
     0) ;;
     *) echo "无效选项。" ;;
@@ -861,16 +906,35 @@ run_action() {
   fi
 }
 
-list_nodes() {
+# Config takes precedence over saved state for active nodes.
+node_inventory() {
+  local state="${1:-$STATE}" config="${2:-$CONFIG}"
   {
-    [ ! -r "$STATE" ] || jq -c '.nodes // {} | to_entries[] | select(.value.inbound.protocol=="vless" or .value.inbound.protocol=="shadowsocks") | {tag:.key, protocol:.value.inbound.protocol,
-      port:.value.inbound.port, disabled:(.value.disabled // false)}' "$STATE"
+    [ ! -r "$state" ] || jq -c '.nodes // {} | to_entries[] | .value + {tag:.key}' "$state"
     jq -c '.inbounds[] | select(.protocol=="vless" or .protocol=="shadowsocks") |
-      {tag,protocol,port,disabled:false}' "$CONFIG"
-  } | jq -rs '
-    group_by(.tag) | .[] | last |
-    "\(.tag)  [\(.protocol)] 内部端口=\(.port)  \(if .disabled then "停用" else "启用" end)"
-  '
+      {tag,inbound:.,disabled:false}' "$config"
+  } | jq -s 'group_by(.tag) | map(reduce .[] as $n ({}; . + $n)) |
+    map(select(.inbound.protocol=="vless" or .inbound.protocol=="shadowsocks"))'
+}
+
+list_nodes() {
+  printf '%s\n' "$1" | jq -r 'if length==0 then "尚无可管理节点。" else
+    to_entries[] | "\(.key+1). \(.value.tag)  [\(.value.inbound.protocol)] 内部端口=\(.value.inbound.port)  \(if .value.disabled then "停用" else "启用" end)" end'
+}
+
+node_summary() {
+  node_inventory "${2:-$STATE}" "${3:-$CONFIG}" | jq -r --arg tag "$1" '
+    def onoff: if . then "开启" else "关闭" end;
+    def limit: if .==0 then "不限" else tostring end;
+    .[] | select(.tag==$tag) |
+    "节点: \(.tag)  [\(.inbound.protocol)]  \(if .disabled then "已停用" else "已启用" end)",
+    (if .disabled then "停用原因: \(.disabled_reason | if .=="monthly_quota" then "月流量超限" elif .=="connection_limit" then "连接数超限" elif .=="manual" then "手动停用" else "未记录" end)" else empty end),
+    "内部端口: \(.inbound.port)  外部端口: \(.public_port // "未设置")",
+    "客户端地址: \(.public_host // "未设置")",
+    (if .inbound.streamSettings.security=="reality" then "SNI: \(.inbound.streamSettings.realitySettings.serverNames | join(", "))" else empty end),
+    "字节统计: \((.statistics // false) | onoff)  连接日志: \((.logging // false) | onoff)",
+    "月流量: \((.quota_gib // 0) | limit)\(if (.quota_gib // 0)>0 then " GiB；每月 \(.reset_day // 1) 日 UTC 重置" else "" end)",
+    "连接上限: \((.max_connections // 0) | limit)"'
 }
 
 node_exists() {
@@ -879,11 +943,12 @@ node_exists() {
 }
 
 node_menu() {
-  local tag action result choice
+  local tag action result choice disabled
   tag="$1"
   while node_exists "$tag"; do
     echo
-    echo "节点: $tag"
+    node_summary "$tag"
+    disabled="$(node_inventory | jq -r --arg tag "$tag" '.[] | select(.tag==$tag) | .disabled // false')"
     echo "1. 显示导入链接"
     echo "2. 查看流量统计与连接日志"
     echo "3. 开通节点流量统计"
@@ -893,8 +958,7 @@ node_menu() {
     echo "7. 设置最大连接数（0=无限制）"
     echo "8. 修改节点配置"
     echo "9. 改名"
-    echo "10. 启用节点"
-    echo "11. 停用节点"
+    if [ "$disabled" = true ]; then echo "10. 启用节点"; else echo "11. 停用节点"; fi
     echo "12. 删除节点"
     echo "0. 返回完整列表，重新选择节点"
     choice="$(ask "选择节点操作")"
@@ -917,6 +981,7 @@ node_menu() {
 }
 
 main() {
+  local inventory selection tag
   need_tools
   if [ "${1:-}" = --action ]; then
     [ "$#" -eq 3 ] || die "操作参数不完整。"
@@ -936,15 +1001,27 @@ main() {
   while :; do
     echo
     echo "Xray 节点管理器"
-    list_nodes
+    inventory="$(node_inventory)"
+    list_nodes "$inventory"
     echo "1. 选择节点"
     echo "2. 检查当前配置"
     echo "0. 退出"
     case "$(ask "选择")" in
       0) exit 0 ;;
-      2) "$XRAY_BIN" run -test -format json -config "$CONFIG" ;;
+      2)
+        if "$XRAY_BIN" run -test -format json -config "$CONFIG"; then
+          echo "当前配置检查通过。"
+        else
+          echo "当前配置检查失败，请按上方错误修正后重试。"
+        fi ;;
       1)
-        tag="$(ask "节点名称")"
+        selection="$(ask "节点编号或名称（0 返回）")"
+        [ "$selection" != 0 ] || continue
+        tag="$selection"
+        if valid_number "$selection"; then
+          tag="$(printf '%s\n' "$inventory" | jq -r --argjson n "$selection" '.[$n-1].tag // empty')"
+          [ -n "$tag" ] || { echo "编号不存在。"; continue; }
+        fi
         valid_name "$tag" || { echo "名称必须以字母开头，后续仅字母和数字。"; continue; }
         node_exists "$tag" || { echo "节点不存在。"; continue; }
         node_menu "$tag"
